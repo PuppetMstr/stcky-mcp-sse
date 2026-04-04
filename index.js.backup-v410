@@ -1,0 +1,408 @@
+/**
+ * STCKY MCP SSE Server v4.1.0
+ * 11 tools - Temporal NOW model fully wired
+ * 
+ * TEMPORAL NOW MODEL: Everything orbits NOW
+ * - associative_recall: vector + temporal scoring (use for startup context)
+ * - memory_upcoming: surface future-anchored memories due NOW
+ * - memory_list: flat list (use only when you need all of a category)
+ */
+import express from 'express';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema
+} from '@modelcontextprotocol/sdk/types.js';
+
+const app = express();
+app.use(express.json());
+
+const API_URL = process.env.STCKY_API_URL || 'https://cleo-api.vercel.app';
+
+function getApiKey(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7);
+  }
+  return req.query.apiKey || req.query.api_key;
+}
+
+function formatTimestamp(isoString) {
+  if (!isoString) return null;
+  const date = new Date(isoString);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[date.getMonth()] + ' ' + date.getDate();
+}
+
+async function apiCall(apiKey, method, endpoint, body = null) {
+  const options = {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json'
+    }
+  };
+  if (body) options.body = JSON.stringify(body);
+  const response = await fetch(API_URL + endpoint, options);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error('API error ' + response.status + ': ' + errorText);
+  }
+  return response.json();
+}
+
+// Tool definitions - associative_recall is PRIMARY. All other tools serve it.
+const TOOLS = [
+  {
+    name: 'associative_recall',
+    description: 'PRIMARY RECALL MECHANISM. Use this first, always. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Use for startup context, discovery, and any question about what is relevant. All other recall tools serve this one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language query' },
+        limit: { type: 'number', description: 'Max results' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'memory_upcoming',
+    description: 'STARTUP FEED. Surfaces time-anchored memories (appointments, deadlines, events) with relevantDate approaching NOW. Call at session start BEFORE associative_recall so time-sensitive items are in context.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: 'How many days ahead to look (default 7)' },
+        limit: { type: 'number', description: 'Max results (default 10)' }
+      }
+    }
+  },
+  {
+    name: 'session_recent',
+    description: 'STARTUP FEED. Returns recent session history. Call at session start BEFORE associative_recall so prior context is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Number of sessions' }
+      }
+    }
+  },
+  {
+    name: 'memory_store',
+    description: 'Save a fact to persistent memory. Include relevantDate (ISO string) for time-sensitive memories. Well-tagged memories with relevantDate surface correctly in associative_recall.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Category' },
+        key: { type: 'string', description: 'Short identifier' },
+        value: { type: 'string', description: 'Content to remember' },
+        tags: { type: 'string', description: 'Optional tags' },
+        source: { type: 'string', description: 'Optional source' },
+        relevantDate: { type: 'string', description: 'ISO date string for when this memory becomes relevant' }
+      },
+      required: ['category', 'key', 'value']
+    }
+  },
+  {
+    name: 'memory_recall',
+    description: 'EXACT LOOKUP ONLY. Use ONLY when you know the precise category+key. Do NOT use for discovery or startup — use associative_recall instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Filter by category' },
+        key: { type: 'string', description: 'Filter by exact key' },
+        searchTerm: { type: 'string', description: 'Keyword search (prefer associative_recall)' }
+      }
+    }
+  },
+  {
+    name: 'memory_list',
+    description: 'FULL CATEGORY AUDIT ONLY. Returns all memories in a category unranked. Use ONLY when you need complete inventory. Do NOT use for startup or discovery — use associative_recall instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Category to list' },
+        limit: { type: 'number', description: 'Max results' }
+      },
+      required: ['category']
+    }
+  },
+  {
+    name: 'session_start',
+    description: 'Begin a new session. Call after memory_upcoming and session_recent feeds are loaded.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tags: { type: 'string', description: 'Optional tags' }
+      }
+    }
+  },
+  {
+    name: 'session_end',
+    description: 'End a session with summary. Store decisions and pending items so associative_recall surfaces them in future sessions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'number', description: 'Session ID' },
+        summary: { type: 'string', description: 'What was accomplished' },
+        decisions: { type: 'string', description: 'Key decisions' },
+        pending: { type: 'string', description: 'Next steps' }
+      },
+      required: ['sessionId', 'summary']
+    }
+  },
+  {
+    name: 'project_list',
+    description: 'List all projects. For project context during work, prefer associative_recall.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: 'Filter by status' }
+      }
+    }
+  },
+  {
+    name: 'project_get',
+    description: 'Get full details for a specific project by name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Project name' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'enrich',
+    description: 'Extract entities from a message and retrieve relevant memory clusters. Call on messages with proper nouns or project names to feed associative_recall with targeted context.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'The user message to analyze' }
+      },
+      required: ['message']
+    }
+  }
+];
+
+// Tool handlers
+async function handleTool(apiKey, name, args) {
+  try {
+    switch (name) {
+      case 'memory_store': {
+        const { category, key, value, tags, source, relevantDate } = args;
+        const body = { category, key, value };
+        if (tags) body.tags = tags;
+        if (source) body.source = source;
+        if (relevantDate) body.relevantDate = relevantDate;
+        await apiCall(apiKey, 'POST', '/api/memory', body);
+        return { content: [{ type: 'text', text: 'Stored [' + category + '] ' + key + (relevantDate ? ' (relevant: ' + relevantDate + ')' : '') }] };
+      }
+
+      case 'memory_recall': {
+        const { category, key, searchTerm } = args;
+        const body = {};
+        if (category) body.category = category;
+        if (key) body.key = key;
+        if (searchTerm) body.searchTerm = searchTerm;
+        const result = await apiCall(apiKey, 'POST', '/api/memory/recall', body);
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories found.' }] };
+        }
+        let output = result.memories.length + ' memories found:\n\n';
+        result.memories.forEach(m => {
+          output += '- [' + m.category + '] ' + m.key + ': ' + m.value.substring(0, 150) + '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'memory_list': {
+        const category = args.category;
+        const limit = args.limit || 50;
+        const result = await apiCall(apiKey, 'POST', '/api/memory/list', { category, limit });
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories in [' + category + ']' }] };
+        }
+        let output = result.memories.length + ' memories in [' + category + ']:\n\n';
+        result.memories.forEach(m => {
+          const ts = formatTimestamp(m.updatedAt || m.createdAt);
+          output += '- ' + m.key + (ts ? ' (' + ts + ')' : '') + ': ' + m.value.substring(0, 100) + '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'memory_upcoming': {
+        const days = args.days || 7;
+        const limit = args.limit || 10;
+        const result = await apiCall(apiKey, 'GET', '/api/memory/upcoming?days=' + days + '&limit=' + limit);
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No upcoming memories in the next ' + days + ' days.' }] };
+        }
+        let output = result.memories.length + ' upcoming in next ' + days + ' days:\n\n';
+        result.memories.forEach(m => {
+          const rd = m.relevantDate ? new Date(m.relevantDate).toLocaleDateString() : '';
+          output += '⏰ [' + m.category + '] ' + m.key + (rd ? ' — ' + rd : '') + '\n   ' + m.value.substring(0, 150) + '\n\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'session_start': {
+        const body = {};
+        if (args.tags) body.tags = args.tags;
+        const result = await apiCall(apiKey, 'POST', '/api/session/start', body);
+        return { content: [{ type: 'text', text: 'Session #' + result.sessionId + ' started' }] };
+      }
+
+      case 'session_end': {
+        const { sessionId, summary, decisions, pending } = args;
+        const body = { sessionId, summary };
+        if (decisions) body.decisions = decisions;
+        if (pending) body.pending = pending;
+        await apiCall(apiKey, 'POST', '/api/session/end', body);
+        return { content: [{ type: 'text', text: 'Session #' + sessionId + ' ended.' }] };
+      }
+
+      case 'session_recent': {
+        const limit = args.limit || 5;
+        const result = await apiCall(apiKey, 'GET', '/api/session/recent?limit=' + limit);
+        if (!result.sessions || result.sessions.length === 0) {
+          return { content: [{ type: 'text', text: 'No recent sessions.' }] };
+        }
+        let output = 'Last ' + result.sessions.length + ' sessions:\n\n';
+        result.sessions.forEach(s => {
+          const ts = formatTimestamp(s.createdAt);
+          output += 'Session #' + s.sessionNumber + ' [' + s.status + '] - ' + (ts || '') + '\n';
+          if (s.summary) output += '  Summary: ' + s.summary + '\n';
+          if (s.pending) output += '  Pending: ' + s.pending + '\n';
+          output += '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'project_list': {
+        let endpoint = '/api/project';
+        if (args.status) endpoint += '?status=' + args.status;
+        const result = await apiCall(apiKey, 'GET', endpoint);
+        if (!result.projects || result.projects.length === 0) {
+          return { content: [{ type: 'text', text: 'No projects found.' }] };
+        }
+        let output = result.projects.length + ' projects:\n\n';
+        result.projects.forEach(p => {
+          output += '- ' + p.name + ' [' + (p.status || 'active') + ']\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'project_get': {
+        const result = await apiCall(apiKey, 'GET', '/api/project/' + encodeURIComponent(args.name));
+        if (!result.project) {
+          return { content: [{ type: 'text', text: 'Project not found.' }] };
+        }
+        const p = result.project;
+        let output = 'Project: ' + p.name + '\nStatus: ' + (p.status || 'active') + '\n';
+        if (p.description) output += 'Description: ' + p.description + '\n';
+        if (p.basePath) output += 'Path: ' + p.basePath + '\n';
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'associative_recall': {
+        const query = args.query;
+        const limit = args.limit || 10;
+        const result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No related memories found.' }] };
+        }
+        let output = result.memories.length + ' related memories:\n\n';
+        result.memories.forEach((m, i) => {
+          const score = m.score ? ' (' + (m.score * 100).toFixed(0) + '%)' : '';
+          const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
+          output += (i + 1) + '. [' + m.category + '] ' + m.key + score + rd + '\n   ' + m.value.substring(0, 120) + '\n\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'enrich': {
+        const result = await apiCall(apiKey, 'POST', '/api/enrich', { message: args.message });
+        if (!result.enriched) {
+          return { content: [{ type: 'text', text: 'No relevant context found for: ' + result.entities.join(', ') }] };
+        }
+        return { content: [{ type: 'text', text: result.contextBlock }] };
+      }
+
+      default:
+        return { content: [{ type: 'text', text: 'Unknown tool: ' + name }], isError: true };
+    }
+  } catch (error) {
+    return { content: [{ type: 'text', text: 'Failed: ' + error.message }], isError: true };
+  }
+}
+
+function createServer(apiKey) {
+  const server = new Server(
+    { name: 'stcky', version: '4.2.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    return handleTool(apiKey, name, args || {});
+  });
+
+  return server;
+}
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    version: '4.2.0', 
+    tools: 11, 
+    brain: 'V2',
+    temporal: 'NOW model active'
+  });
+});
+
+app.get('/sse', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+  const server = createServer(apiKey);
+  const transport = new SSEServerTransport('/messages', res);
+  await server.connect(transport);
+});
+
+app.post('/messages', (req, res) => res.json({ ok: true }));
+
+app.post('/mcp', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const server = createServer(apiKey);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    res.status(500).json({ error: 'internal_error', message: error.message });
+  }
+});
+
+app.post('/sse', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const server = createServer(apiKey);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    res.status(500).json({ error: 'internal_error', message: error.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('STCKY MCP v4.1.0 on port ' + PORT));
+
+export default app;

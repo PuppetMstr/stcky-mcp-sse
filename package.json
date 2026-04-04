@@ -1,0 +1,19 @@
+{
+  "name": "stcky-mcp-sse",
+  "version": "4.4.0",
+  "description": "STCKY MCP Server - Cloud Memory for AI with graceful degradation",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "express": "^4.18.2",
+    "mongodb": "^7.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

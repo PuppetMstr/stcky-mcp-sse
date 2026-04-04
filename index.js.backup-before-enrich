@@ -1,0 +1,349 @@
+/**
+ * STCKY MCP SSE Server v4.0.7
+ * 9 tools - using raw Server class for full control
+ */
+import express from 'express';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema
+} from '@modelcontextprotocol/sdk/types.js';
+
+const app = express();
+app.use(express.json());
+
+const API_URL = process.env.STCKY_API_URL || 'https://cleo-api.vercel.app';
+
+function getApiKey(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7);
+  }
+  return req.query.apiKey || req.query.api_key;
+}
+
+function formatTimestamp(isoString) {
+  if (!isoString) return null;
+  const date = new Date(isoString);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[date.getMonth()] + ' ' + date.getDate();
+}
+
+async function apiCall(apiKey, method, endpoint, body = null) {
+  const options = {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json'
+    }
+  };
+  if (body) options.body = JSON.stringify(body);
+  const response = await fetch(API_URL + endpoint, options);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error('API error ' + response.status + ': ' + errorText);
+  }
+  return response.json();
+}
+
+// Tool definitions with proper JSON Schema
+const TOOLS = [
+  {
+    name: 'memory_store',
+    description: 'Save a fact to persistent memory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Category' },
+        key: { type: 'string', description: 'Short identifier' },
+        value: { type: 'string', description: 'Content to remember' },
+        tags: { type: 'string', description: 'Optional tags' },
+        source: { type: 'string', description: 'Optional source' }
+      },
+      required: ['category', 'key', 'value']
+    }
+  },
+  {
+    name: 'memory_recall',
+    description: 'Search memories.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Filter by category' },
+        key: { type: 'string', description: 'Filter by key' },
+        searchTerm: { type: 'string', description: 'Keyword search' }
+      }
+    }
+  },
+  {
+    name: 'memory_list',
+    description: 'List memories in a category.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: 'Category to list' },
+        limit: { type: 'number', description: 'Max results' }
+      },
+      required: ['category']
+    }
+  },
+  {
+    name: 'session_start',
+    description: 'Begin a new session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tags: { type: 'string', description: 'Optional tags' }
+      }
+    }
+  },
+  {
+    name: 'session_end',
+    description: 'End a session with summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'number', description: 'Session ID' },
+        summary: { type: 'string', description: 'What was accomplished' },
+        decisions: { type: 'string', description: 'Key decisions' },
+        pending: { type: 'string', description: 'Next steps' }
+      },
+      required: ['sessionId', 'summary']
+    }
+  },
+  {
+    name: 'session_recent',
+    description: 'Get recent sessions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Number of sessions' }
+      }
+    }
+  },
+  {
+    name: 'project_list',
+    description: 'List all projects.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: 'Filter by status' }
+      }
+    }
+  },
+  {
+    name: 'project_get',
+    description: 'Get project details.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Project name' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'associative_recall',
+    description: 'Semantic search using vector embeddings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language query' },
+        limit: { type: 'number', description: 'Max results' }
+      },
+      required: ['query']
+    }
+  }
+];
+
+// Tool handlers
+async function handleTool(apiKey, name, args) {
+  try {
+    switch (name) {
+      case 'memory_store': {
+        const { category, key, value, tags, source } = args;
+        const body = { category, key, value };
+        if (tags) body.tags = tags;
+        if (source) body.source = source;
+        await apiCall(apiKey, 'POST', '/api/memory/store', body);
+        return { content: [{ type: 'text', text: 'Stored [' + category + '] ' + key }] };
+      }
+
+      case 'memory_recall': {
+        const { category, key, searchTerm } = args;
+        const body = {};
+        if (category) body.category = category;
+        if (key) body.key = key;
+        if (searchTerm) body.searchTerm = searchTerm;
+        const result = await apiCall(apiKey, 'POST', '/api/memory/recall', body);
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories found.' }] };
+        }
+        let output = result.memories.length + ' memories found:\n\n';
+        result.memories.forEach(m => {
+          output += '- [' + m.category + '] ' + m.key + ': ' + m.value.substring(0, 150) + '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'memory_list': {
+        const category = args.category;
+        const limit = args.limit || 50;
+        const result = await apiCall(apiKey, 'POST', '/api/memory/list', { category, limit });
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories in [' + category + ']' }] };
+        }
+        let output = result.memories.length + ' memories in [' + category + ']:\n\n';
+        result.memories.forEach(m => {
+          const ts = formatTimestamp(m.updatedAt || m.createdAt);
+          output += '- ' + m.key + (ts ? ' (' + ts + ')' : '') + ': ' + m.value.substring(0, 100) + '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'session_start': {
+        const body = {};
+        if (args.tags) body.tags = args.tags;
+        const result = await apiCall(apiKey, 'POST', '/api/session/start', body);
+        return { content: [{ type: 'text', text: 'Session #' + result.sessionId + ' started' }] };
+      }
+
+      case 'session_end': {
+        const { sessionId, summary, decisions, pending } = args;
+        const body = { sessionId, summary };
+        if (decisions) body.decisions = decisions;
+        if (pending) body.pending = pending;
+        await apiCall(apiKey, 'POST', '/api/session/end', body);
+        return { content: [{ type: 'text', text: 'Session #' + sessionId + ' ended.' }] };
+      }
+
+      case 'session_recent': {
+        const limit = args.limit || 5;
+        const result = await apiCall(apiKey, 'GET', '/api/session/recent?limit=' + limit);
+        if (!result.sessions || result.sessions.length === 0) {
+          return { content: [{ type: 'text', text: 'No recent sessions.' }] };
+        }
+        let output = 'Last ' + result.sessions.length + ' sessions:\n\n';
+        result.sessions.forEach(s => {
+          const ts = formatTimestamp(s.createdAt);
+          output += 'Session #' + s.sessionNumber + ' [' + s.status + '] - ' + (ts || '') + '\n';
+          if (s.summary) output += '  Summary: ' + s.summary + '\n';
+          if (s.pending) output += '  Pending: ' + s.pending + '\n';
+          output += '\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'project_list': {
+        let endpoint = '/api/project';
+        if (args.status) endpoint += '?status=' + args.status;
+        const result = await apiCall(apiKey, 'GET', endpoint);
+        if (!result.projects || result.projects.length === 0) {
+          return { content: [{ type: 'text', text: 'No projects found.' }] };
+        }
+        let output = result.projects.length + ' projects:\n\n';
+        result.projects.forEach(p => {
+          output += '- ' + p.name + ' [' + (p.status || 'active') + ']\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'project_get': {
+        const result = await apiCall(apiKey, 'GET', '/api/project/' + encodeURIComponent(args.name));
+        if (!result.project) {
+          return { content: [{ type: 'text', text: 'Project not found.' }] };
+        }
+        const p = result.project;
+        let output = 'Project: ' + p.name + '\nStatus: ' + (p.status || 'active') + '\n';
+        if (p.description) output += 'Description: ' + p.description + '\n';
+        if (p.basePath) output += 'Path: ' + p.basePath + '\n';
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      case 'associative_recall': {
+        const query = args.query;
+        const limit = args.limit || 10;
+        const result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No related memories found.' }] };
+        }
+        let output = result.memories.length + ' related memories:\n\n';
+        result.memories.forEach((m, i) => {
+          const score = m.score ? ' (' + (m.score * 100).toFixed(0) + '%)' : '';
+          output += (i + 1) + '. [' + m.category + '] ' + m.key + score + '\n   ' + m.value.substring(0, 120) + '\n\n';
+        });
+        return { content: [{ type: 'text', text: output }] };
+      }
+
+      default:
+        return { content: [{ type: 'text', text: 'Unknown tool: ' + name }], isError: true };
+    }
+  } catch (error) {
+    return { content: [{ type: 'text', text: 'Failed: ' + error.message }], isError: true };
+  }
+}
+
+function createServer(apiKey) {
+  const server = new Server(
+    { name: 'stcky', version: '4.0.7' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    return handleTool(apiKey, name, args || {});
+  });
+
+  return server;
+}
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', version: '4.0.7', tools: 9, brain: 'V2' });
+});
+
+app.get('/sse', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+  const server = createServer(apiKey);
+  const transport = new SSEServerTransport('/messages', res);
+  await server.connect(transport);
+});
+
+app.post('/messages', (req, res) => res.json({ ok: true }));
+
+app.post('/mcp', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const server = createServer(apiKey);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    res.status(500).json({ error: 'internal_error', message: error.message });
+  }
+});
+
+app.post('/sse', async (req, res) => {
+  const apiKey = getApiKey(req);
+  if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const server = createServer(apiKey);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    res.status(500).json({ error: 'internal_error', message: error.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('STCKY MCP v4.0.7 on port ' + PORT));
+
+export default app;

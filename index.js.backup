@@ -1,0 +1,415 @@
+/**
+ * STCKY MCP SSE Server v3.0.3 - Cloud Memory for AI
+ * For claude.ai web connector
+ * 
+ * CHANGELOG v3.0.3:
+ * - FIXED: formatTimestamp now uses simple string formatting (toLocaleDateString fails in Vercel)
+ * 
+ * CHANGELOG v3.0.2:
+ * - FIXED: Use POST for memory/list and memory/recall (API expects POST, not GET)
+ * - Timestamps now work because API response is properly received
+ * 
+ * CHANGELOG v3.0.1:
+ * - Added timestamp visibility to memory_list and memory_recall
+ * - Claude can now do temporal reasoning (fresh vs stale, today vs last month)
+ * 
+ * 8 Tools (all proven to work across platforms):
+ * 1. memory_store - Save a memory
+ * 2. memory_recall - Search memories
+ * 3. memory_list - List by category
+ * 4. session_start - Begin a conversation
+ * 5. session_end - End with summary
+ * 6. session_recent - Get recent sessions
+ * 7. project_list - List projects
+ * 8. project_get - Get project details
+ * 
+ * STARTUP PROTOCOL (works on all AI clients):
+ * 1. session_recent (limit=3)
+ * 2. memory_list (category=pending)
+ * 3. memory_list (category=preference)
+ * 4. memory_list (category=person)
+ */
+
+import express from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+
+const app = express();
+const API_URL = process.env.STCKY_API_URL || 'https://cleo-api.vercel.app';
+
+// Parse API key from query string for SSE connections
+function getApiKey(req) {
+  return req.query.apiKey || req.headers.authorization?.replace('Bearer ', '');
+}
+
+// =========================================================================
+// TIMESTAMP FORMATTER - Enables temporal reasoning
+// Simple formatting that works in all Node.js environments
+// =========================================================================
+function formatTimestamp(isoString) {
+  if (!isoString) return '';
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return '';
+    
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const month = months[d.getMonth()];
+    const day = d.getDate();
+    
+    // Simple format: "Mar 17"
+    return `${month} ${day}`;
+  } catch (e) {
+    return '';
+  }
+}
+
+// API helper
+async function apiCall(apiKey, method, endpoint, body = null) {
+  const options = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    }
+  };
+  
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+  
+  const response = await fetch(`${API_URL}${endpoint}`, options);
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`API error ${response.status}: ${errorText}`);
+  }
+  
+  return response.json();
+}
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    version: '3.0.3',
+    tools: 8,
+    brain: 'V2',
+    protocol: '4-call startup',
+    features: ['temporal-awareness']
+  });
+});
+
+// SSE endpoint
+app.get('/sse', async (req, res) => {
+  const apiKey = getApiKey(req);
+  
+  if (!apiKey) {
+    return res.status(401).json({ error: 'API key required. Use ?apiKey=YOUR_KEY' });
+  }
+  
+  // Create MCP server for this connection
+  const server = new McpServer({
+    name: 'stcky',
+    version: '3.0.3'
+  });
+  
+  // =========================================================================
+  // TOOL 1: memory_store
+  // =========================================================================
+  server.tool(
+    'memory_store',
+    'Save a fact, decision, preference, or any information to persistent memory.',
+    {
+      category: {
+        type: 'string',
+        description: 'Category: project, decision, bug, path, preference, person, config, pending, reference, snippet',
+        enum: ['project', 'decision', 'bug', 'path', 'preference', 'person', 'config', 'pending', 'reference', 'snippet']
+      },
+      key: { type: 'string', description: 'Short identifier' },
+      value: { type: 'string', description: 'Content to remember' },
+      tags: { type: 'string', description: 'Optional comma-separated tags' },
+      source: { type: 'string', description: 'Optional context/conversation source' }
+    },
+    async ({ category, key, value, tags, source }) => {
+      try {
+        const body = { category, key, value };
+        if (tags) body.tags = tags;
+        if (source) body.source = source;
+        
+        await apiCall(apiKey, 'POST', '/api/memory/store', body);
+        
+        return {
+          content: [{ type: 'text', text: `Memory stored: [${category}] ${key}` }]
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 2: memory_recall - NOW WITH TIMESTAMPS (FIXED: uses POST)
+  // =========================================================================
+  server.tool(
+    'memory_recall',
+    'Search memories by category, key, or search term.',
+    {
+      category: { type: 'string', description: 'Filter by category' },
+      key: { type: 'string', description: 'Filter by exact key' },
+      searchTerm: { type: 'string', description: 'Search across all fields' }
+    },
+    async ({ category, key, searchTerm }) => {
+      try {
+        // FIXED: Use POST with body instead of GET with query params
+        const body = {};
+        if (category) body.category = category;
+        if (key) body.key = key;
+        if (searchTerm) body.searchTerm = searchTerm;
+        
+        const result = await apiCall(apiKey, 'POST', '/api/memory/recall', body);
+        
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: 'No memories found.' }] };
+        }
+        
+        let output = `Found ${result.memories.length} memories:\n\n`;
+        result.memories.forEach(m => {
+          const ts = formatTimestamp(m.updatedAt || m.createdAt);
+          const tsDisplay = ts ? ` (${ts})` : '';
+          output += `[${m.category}] ${m.key}${tsDisplay}: ${m.value.substring(0, 300)}${m.value.length > 300 ? '...' : ''}\n\n`;
+        });
+        
+        return { content: [{ type: 'text', text: output }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 3: memory_list - NOW WITH TIMESTAMPS (FIXED: uses POST)
+  // =========================================================================
+  server.tool(
+    'memory_list',
+    'List all memories in a category.',
+    {
+      category: {
+        type: 'string',
+        description: 'Category to list',
+        enum: ['project', 'decision', 'bug', 'path', 'preference', 'person', 'config', 'pending', 'reference', 'snippet']
+      },
+      limit: { type: 'number', description: 'Max results (default 50)' }
+    },
+    async ({ category, limit = 50 }) => {
+      try {
+        // FIXED: Use POST with body instead of GET with query params
+        const result = await apiCall(apiKey, 'POST', '/api/memory/list', { category, limit });
+        
+        if (!result.memories || result.memories.length === 0) {
+          return { content: [{ type: 'text', text: `No memories in [${category}]` }] };
+        }
+        
+        let output = `${result.memories.length} memories in [${category}]:\n\n`;
+        result.memories.forEach(m => {
+          const ts = formatTimestamp(m.updatedAt || m.createdAt);
+          const tsDisplay = ts ? ` (${ts})` : '';
+          output += `- ${m.key}${tsDisplay}: ${m.value.substring(0, 100)}${m.value.length > 100 ? '...' : ''}\n`;
+        });
+        
+        return { content: [{ type: 'text', text: output }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 4: session_start
+  // =========================================================================
+  server.tool(
+    'session_start',
+    'Begin a new conversation session.',
+    {
+      tags: { type: 'string', description: 'Optional comma-separated tags' }
+    },
+    async ({ tags }) => {
+      try {
+        const body = {};
+        if (tags) body.tags = tags;
+        
+        const result = await apiCall(apiKey, 'POST', '/api/session/start', body);
+        
+        return {
+          content: [{ type: 'text', text: `Session #${result.sessionId} started` }]
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 5: session_end
+  // =========================================================================
+  server.tool(
+    'session_end',
+    'End a session with summary.',
+    {
+      sessionId: { type: 'number', description: 'Session ID' },
+      summary: { type: 'string', description: 'What was accomplished' },
+      decisions: { type: 'string', description: 'Key decisions made' },
+      pending: { type: 'string', description: 'Next steps' }
+    },
+    async ({ sessionId, summary, decisions, pending }) => {
+      try {
+        const body = { sessionId, summary };
+        if (decisions) body.decisions = decisions;
+        if (pending) body.pending = pending;
+        
+        await apiCall(apiKey, 'POST', '/api/session/end', body);
+        
+        return {
+          content: [{ type: 'text', text: `Session #${sessionId} ended.\nSummary: ${summary}` }]
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 6: session_recent (GET is fine here - API uses GET)
+  // =========================================================================
+  server.tool(
+    'session_recent',
+    'Get recent session summaries.',
+    {
+      limit: { type: 'number', description: 'Number of sessions (default 5)' }
+    },
+    async ({ limit = 5 }) => {
+      try {
+        const result = await apiCall(apiKey, 'GET', `/api/session/recent?limit=${limit}`);
+        
+        if (!result.sessions || result.sessions.length === 0) {
+          return { content: [{ type: 'text', text: 'No recent sessions.' }] };
+        }
+        
+        let output = `Last ${result.sessions.length} sessions:\n\n`;
+        result.sessions.forEach(s => {
+          const ts = formatTimestamp(s.startedAt || s.createdAt);
+          output += `Session #${s.sessionNumber || s.id} [${s.status}] - ${ts}\n`;
+          output += `  Summary: ${s.summary || '(in progress)'}\n`;
+          if (s.pending) output += `  Pending: ${s.pending}\n`;
+          output += '\n';
+        });
+        
+        return { content: [{ type: 'text', text: output }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 7: project_list (GET is fine - API uses GET)
+  // =========================================================================
+  server.tool(
+    'project_list',
+    'List all registered projects.',
+    {
+      status: { type: 'string', description: 'Filter by status: active, paused, completed, archived' }
+    },
+    async ({ status }) => {
+      try {
+        let endpoint = '/api/project';
+        if (status) endpoint += `?status=${status}`;
+        
+        const result = await apiCall(apiKey, 'GET', endpoint);
+        
+        if (!result.projects || result.projects.length === 0) {
+          return { content: [{ type: 'text', text: 'No projects found.' }] };
+        }
+        
+        let output = `${result.projects.length} projects:\n\n`;
+        result.projects.forEach(p => {
+          output += `- ${p.name} [${p.status}]: ${p.description || '(no description)'}\n`;
+        });
+        
+        return { content: [{ type: 'text', text: output }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // =========================================================================
+  // TOOL 8: project_get (GET is fine - API uses GET)
+  // =========================================================================
+  server.tool(
+    'project_get',
+    'Get full context for a registered project.',
+    {
+      name: { type: 'string', description: 'Project name' }
+    },
+    async ({ name }) => {
+      try {
+        const result = await apiCall(apiKey, 'GET', `/api/project/${encodeURIComponent(name)}`);
+        
+        if (!result.project) {
+          return { content: [{ type: 'text', text: `Project "${name}" not found.` }] };
+        }
+        
+        const p = result.project;
+        let output = `== ${p.name} ==\n`;
+        output += `Status: ${p.status}\n`;
+        if (p.description) output += `Description: ${p.description}\n`;
+        if (p.basePath) output += `Path: ${p.basePath}\n`;
+        if (p.notes) output += `Notes: ${p.notes}\n`;
+        
+        return { content: [{ type: 'text', text: output }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Failed: ${error.message}` }],
+          isError: true
+        };
+      }
+    }
+  );
+  
+  // Connect via SSE transport
+  const transport = new SSEServerTransport('/messages', res);
+  await server.connect(transport);
+});
+
+// Message endpoint for SSE
+app.post('/messages', express.json(), async (req, res) => {
+  res.json({ ok: true });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`STCKY MCP SSE v3.0.3 running on port ${PORT}`);
+});
+
+export default app;
