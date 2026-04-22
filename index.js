@@ -1,16 +1,31 @@
 /**
- * STCKY MCP SSE Server v4.4.0 - RESILIENT CORE
- * 
- * CHANGELOG v4.4.0:
- * - Graceful degradation: API failures return degraded response, not crash
- * - Deep health check integration
- * - AI can continue without memory when backend is down
- * 
- * CORE TOOLS:
- * 1. associative_recall — semantic + temporal retrieval (PRIMARY)
- * 2. memory_store — save memories
- * 3. enrich — entity extraction + cluster activation
- * 4. project_get — project context (if needed)
+ * STCKY MCP SSE Server v4.9.0 — INGEST + AUTH HARDENING
+ *
+ * CHANGELOG v4.9.0:
+ * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP
+ *   connection. Closes Apr 18 P0 bug where any non-empty string passed auth.
+ *   Validation cached for 60s per key to avoid hammering the upstream API.
+ * - ADDED: ingest — POST to /api/ingest for content-addressed immutable capture.
+ *   This is the cross-platform primitive that makes auto-capture possible.
+ * - CHANGED: Default API_URL fallback is now https://api.stcky.ai (canonical).
+ *   STCKY_API_URL env var still overrides if set.
+ *
+ * CHANGELOG v4.8.0:
+ * - ADDED: get_now — returns current time in user's timezone
+ * - ADDED: set_timezone — update user's timezone preference
+ *
+ * CHANGELOG v4.7.0:
+ * - ADDED: memory_delete — remove memories by category + key
+ *
+ * CORE TOOLS (8):
+ * 1. get_now — current time awareness (CALL FIRST)
+ * 2. associative_recall — semantic + temporal retrieval (PRIMARY)
+ * 3. memory_store — save curated memories
+ * 4. memory_delete — remove memories by category + key
+ * 5. enrich — entity extraction + cluster activation
+ * 6. project_get — project context
+ * 7. set_timezone — update user's timezone
+ * 8. ingest — content-addressed raw capture (auto-capture primitive, v4.9.0)
  */
 import express from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -24,13 +39,22 @@ import {
 const app = express();
 app.use(express.json());
 
-const API_URL = process.env.STCKY_API_URL || 'https://cleo-api.vercel.app';
-const VERSION = '4.4.0';
+const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
+const VERSION = '4.9.0';
+const DEFAULT_TIMEZONE = 'UTC';
 
-// Track API health state
+// Cache user timezones per API key (session-level)
+const timezoneCache = new Map();
+
+// Cache validated API keys. Map<apiKey, { valid: boolean, expiresAt: number }>.
+// 60s TTL — short enough that revoked keys are locked out quickly, long enough
+// to keep per-request overhead off the hot path.
+const authCache = new Map();
+const AUTH_CACHE_TTL_MS = 60_000;
+
 let apiHealthy = true;
 let lastHealthCheck = 0;
-const HEALTH_CHECK_INTERVAL = 60000; // 1 minute
+const HEALTH_CHECK_INTERVAL = 60000;
 
 function getApiKey(req) {
   const authHeader = req.headers.authorization;
@@ -40,6 +64,48 @@ function getApiKey(req) {
   return req.query.apiKey || req.query.api_key;
 }
 
+/**
+ * Validate an API key by calling api.stcky.ai/api/me.
+ * Returns true if the upstream returns 200 (key is valid), false otherwise.
+ * Cached for 60s per key.
+ */
+async function validateApiKey(apiKey) {
+  if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 8) return false;
+
+  const cached = authCache.get(apiKey);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return cached.valid;
+  }
+
+  let valid = false;
+  try {
+    const response = await fetch(API_URL + '/api/me', {
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      }
+    });
+    valid = response.ok;
+  } catch (err) {
+    console.error('[AUTH] Validation fetch failed:', err.message);
+    // On network failure we deliberately fail-closed. Better a false negative
+    // (user retries) than a false positive (unauth'd connection).
+    valid = false;
+  }
+
+  authCache.set(apiKey, { valid, expiresAt: now + AUTH_CACHE_TTL_MS });
+
+  // Opportunistic cache cleanup so the Map doesn't grow unbounded in long-running processes.
+  if (authCache.size > 1000) {
+    for (const [k, v] of authCache.entries()) {
+      if (v.expiresAt <= now) authCache.delete(k);
+    }
+  }
+
+  return valid;
+}
+
 function formatTimestamp(isoString) {
   if (!isoString) return null;
   const date = new Date(isoString);
@@ -47,20 +113,135 @@ function formatTimestamp(isoString) {
   return months[date.getMonth()] + ' ' + date.getDate();
 }
 
-// Degraded response when API is down
+// =============================================================================
+// TEMPORAL AWARENESS — v4.8.0
+// =============================================================================
+async function getUserTimezone(apiKey) {
+  if (timezoneCache.has(apiKey)) {
+    return timezoneCache.get(apiKey);
+  }
+
+  try {
+    const response = await fetch(API_URL + '/api/me', {
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const tz = data.timezone || DEFAULT_TIMEZONE;
+      timezoneCache.set(apiKey, tz);
+      return tz;
+    }
+  } catch (error) {
+    console.error('[TIMEZONE] Failed to fetch user timezone:', error.message);
+  }
+
+  return DEFAULT_TIMEZONE;
+}
+
+function getNow(timezone = DEFAULT_TIMEZONE) {
+  const now = new Date();
+
+  try {
+    const options = {
+      timeZone: timezone,
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    };
+
+    const formatted = now.toLocaleString('en-US', options);
+
+    const shortOptions = {
+      timeZone: timezone,
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    };
+    const short = now.toLocaleString('en-US', shortOptions);
+
+    const tzOffset = now.toLocaleString('en-US', { timeZone: timezone, timeZoneName: 'short' }).split(' ').pop();
+
+    return {
+      iso: now.toISOString(),
+      formatted,
+      short,
+      timezone,
+      tzOffset,
+      unix: now.getTime()
+    };
+  } catch (e) {
+    console.error('[TIMEZONE] Invalid timezone:', timezone, '- falling back to UTC');
+    return getNow(DEFAULT_TIMEZONE);
+  }
+}
+
+// =============================================================================
+// AUTO-STORE ENFORCEMENT
+// =============================================================================
+async function triggerAutoStore(apiKey, toolName, toolInput, toolResult) {
+  // Skip tools that don't produce memory-worthy content, and skip ingest itself
+  // (it's already the auto-capture primitive — routing its own calls back through
+  // enrich would create a feedback loop).
+  if (
+    toolName === 'enrich' ||
+    toolName === 'get_now' ||
+    toolName === 'set_timezone' ||
+    toolName === 'ingest'
+  ) return;
+
+  try {
+    const inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput);
+    const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
+
+    const assistantResponse = `[Tool: ${toolName}]\nInput: ${inputStr.slice(0, 500)}\nResult: ${resultStr.slice(0, 1000)}`;
+
+    const response = await fetch(API_URL + '/api/enrich', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: inputStr.slice(0, 500),
+        assistantResponse: assistantResponse
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data.autoStored && data.autoStored.length > 0) {
+        console.log('[AUTO-STORE] ' + data.autoStored.length + ' memories stored');
+      }
+    }
+  } catch (error) {
+    console.error('[AUTO-STORE] Enrich call failed:', error.message);
+  }
+}
+
 function degradedResponse(toolName, error) {
   const messages = {
-    associative_recall: '⚠️ Memory service temporarily unavailable. I can still help, but I won\'t have access to our conversation history right now. The error was: ' + error,
-    memory_store: '⚠️ Unable to save to memory right now. I\'ll continue without storing this. Error: ' + error,
-    enrich: '⚠️ Context enrichment unavailable. Proceeding without additional context.',
-    project_get: '⚠️ Project lookup unavailable. Please provide project details directly.'
+    associative_recall: '⚠️ Memory service temporarily unavailable. Error: ' + error,
+    memory_store: '⚠️ Unable to save to memory. Error: ' + error,
+    memory_delete: '⚠️ Unable to delete memory. Error: ' + error,
+    enrich: '⚠️ Context enrichment unavailable.',
+    project_get: '⚠️ Project lookup unavailable.',
+    get_now: '⚠️ Time service error: ' + error,
+    set_timezone: '⚠️ Unable to update timezone: ' + error,
+    ingest: '⚠️ Ingest unavailable. Content not captured. Error: ' + error
   };
   return {
-    content: [{ 
-      type: 'text', 
-      text: messages[toolName] || '⚠️ Memory service temporarily unavailable. Error: ' + error
-    }],
-    isError: false  // NOT marking as error — let AI continue gracefully
+    content: [{ type: 'text', text: messages[toolName] || '⚠️ Error: ' + error }],
+    isError: false
   };
 }
 
@@ -73,34 +254,29 @@ async function apiCall(apiKey, method, endpoint, body = null) {
     }
   };
   if (body) options.body = JSON.stringify(body);
-  
+
   try {
     const response = await fetch(API_URL + endpoint, options);
-    
+
     if (!response.ok) {
       const errorText = await response.text();
-      // Track unhealthy state
-      if (response.status >= 500) {
-        apiHealthy = false;
-      }
+      if (response.status >= 500) apiHealthy = false;
       throw new Error('API error ' + response.status + ': ' + errorText.slice(0, 100));
     }
-    
+
     apiHealthy = true;
     return response.json();
   } catch (error) {
-    // Network errors, timeouts, etc.
     apiHealthy = false;
     throw error;
   }
 }
 
-// Background health check
 async function checkApiHealth(apiKey) {
   const now = Date.now();
   if (now - lastHealthCheck < HEALTH_CHECK_INTERVAL) return;
   lastHealthCheck = now;
-  
+
   try {
     const response = await fetch(API_URL + '/api/health/deep?apiKey=' + apiKey);
     const data = await response.json();
@@ -115,8 +291,17 @@ async function checkApiHealth(apiKey) {
 // =============================================================================
 const TOOLS = [
   {
+    name: 'get_now',
+    description: 'Get current time in user\'s timezone. Call this to know what time it is NOW. Essential for temporal awareness.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
     name: 'associative_recall',
-    description: 'PRIMARY RECALL MECHANISM. Use this first, always. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Use for startup context, discovery, and any question about what is relevant. All other recall tools serve this one.',
+    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -128,7 +313,7 @@ const TOOLS = [
   },
   {
     name: 'memory_store',
-    description: 'Save a fact to persistent memory. Include relevantDate (ISO string) for time-sensitive memories. Well-tagged memories with relevantDate surface correctly in associative_recall.',
+    description: 'Save a curated fact to persistent memory (memories collection). For raw turn-by-turn capture, use "ingest" instead. Include relevantDate for time-sensitive memories. Use domain + anchor=true for dormant facts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -137,18 +322,36 @@ const TOOLS = [
         value: { type: 'string', description: 'Content to remember' },
         tags: { type: 'string', description: 'Optional tags' },
         source: { type: 'string', description: 'Optional source' },
-        relevantDate: { type: 'string', description: 'ISO date string for when this memory becomes relevant' }
+        relevantDate: { type: 'string', description: 'ISO date for when this memory becomes relevant' },
+        domain: {
+          type: 'string',
+          enum: ['medical', 'financial', 'family', 'legal', 'travel', 'work', 'personal'],
+          description: 'Domain tag for context-aware surfacing'
+        },
+        anchor: { type: 'boolean', description: 'If true, dormant until domain context detected' }
       },
       required: ['category', 'key', 'value']
     }
   },
   {
-    name: 'enrich',
-    description: 'Extract entities from a message and retrieve relevant memory clusters. Call on messages with proper nouns or project names to feed associative_recall with targeted context.',
+    name: 'memory_delete',
+    description: 'Delete a memory by category and key.',
     inputSchema: {
       type: 'object',
       properties: {
-        message: { type: 'string', description: 'The user message to analyze' }
+        category: { type: 'string', description: 'Category of the memory' },
+        key: { type: 'string', description: 'Key of the memory' }
+      },
+      required: ['category', 'key']
+    }
+  },
+  {
+    name: 'enrich',
+    description: 'Extract entities and retrieve relevant memory clusters. Detects domain context and surfaces dormant anchors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'The message to analyze' }
       },
       required: ['message']
     }
@@ -163,70 +366,192 @@ const TOOLS = [
       },
       required: ['name']
     }
+  },
+  {
+    name: 'set_timezone',
+    description: 'Update user\'s timezone preference. Use IANA timezone names (e.g., America/Los_Angeles, Europe/London, Asia/Tokyo).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timezone: { type: 'string', description: 'IANA timezone name' }
+      },
+      required: ['timezone']
+    }
+  },
+  {
+    name: 'ingest',
+    description: 'Capture raw content into content-addressed immutable storage. This is the auto-capture primitive — call at the end of every substantive conversation turn with a concatenation of the user message, assistant response, and brief tool summary. One object per turn. Same content posted twice is deduplicated (idempotent via SHA-256). Unlike memory_store, ingest does not require curation — it is the raw ledger.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'Raw content to store. Required, non-empty.' },
+        source_type: { type: 'string', description: 'Content classification: conversation | document | email | audio_transcript | file_upload | extracted_statement' },
+        source: { type: 'string', description: 'Optional. provider.interface.conversation_id format, e.g. "claude.web.stcky-build-2026-04-22"' },
+        speaker: { type: 'string', description: 'Optional. Who authored the turn: "steven", "claude", "chaos", etc.' },
+        session_id: { type: 'string', description: 'Optional. Session identifier for grouping related turns.' },
+        turn_index: { type: 'number', description: 'Optional. Incrementing integer within a session, starting at 1.' },
+        timestamp: { type: 'string', description: 'Optional ISO timestamp for when the content was authored. Defaults to server now.' },
+        client: { type: 'string', description: 'Optional interface tag: "web" | "ios" | "ipad" | "desktop" | "api"' },
+        metadata: { type: 'object', description: 'Optional free-form metadata. Stored but not indexed in v0.1.' }
+      },
+      required: ['content', 'source_type']
+    }
   }
 ];
 
 // =============================================================================
-// TOOL HANDLERS — with graceful degradation
+// TOOL HANDLERS
 // =============================================================================
 async function handleTool(apiKey, name, args) {
-  // Background health check
   checkApiHealth(apiKey);
-  
+
   try {
+    let result;
+    let resultText;
+
     switch (name) {
+      case 'get_now': {
+        const timezone = await getUserTimezone(apiKey);
+        const now = getNow(timezone);
+        resultText = `NOW: ${now.formatted}\nTimezone: ${now.timezone} (${now.tzOffset})\nISO: ${now.iso}`;
+        return { content: [{ type: 'text', text: resultText }] };
+      }
+
+      case 'set_timezone': {
+        const { timezone } = args;
+
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: timezone });
+        } catch (e) {
+          return { content: [{ type: 'text', text: 'Invalid timezone: ' + timezone + '. Use IANA format (e.g., America/Los_Angeles)' }] };
+        }
+
+        const response = await fetch(API_URL + '/api/me', {
+          method: 'PUT',
+          headers: {
+            'Authorization': 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ timezone })
+        });
+
+        if (response.ok) {
+          timezoneCache.set(apiKey, timezone);
+          const now = getNow(timezone);
+          resultText = `Timezone updated to ${timezone}.\nCurrent time: ${now.formatted}`;
+        } else {
+          resultText = 'Failed to update timezone.';
+        }
+
+        return { content: [{ type: 'text', text: resultText }] };
+      }
+
       case 'associative_recall': {
         const query = args.query;
         const limit = args.limit || 10;
-        const result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
+        const timezone = await getUserTimezone(apiKey);
+        const now = getNow(timezone);
+
+        result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
+
+        let output = `NOW: ${now.short} (${now.timezone})\n\n`;
+
         if (!result.memories || result.memories.length === 0) {
-          return { content: [{ type: 'text', text: 'No related memories found.' }] };
+          resultText = output + 'No related memories found.';
+        } else {
+          output += result.memories.length + ' related memories:\n\n';
+          result.memories.forEach((m, i) => {
+            const ts = formatTimestamp(m.updatedAt || m.createdAt);
+            const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
+            const anchor = m.anchor ? ' ⚓' : '';
+            const domain = m.domain ? ' [' + m.domain + ']' : '';
+            output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
+            output += '   ' + m.value + '\n\n';
+          });
+          resultText = output;
         }
-        let output = result.memories.length + ' related memories:\n\n';
-        result.memories.forEach((m, i) => {
-          const ts = formatTimestamp(m.updatedAt || m.createdAt);
-          const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
-          output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + '\n';
-          output += '   ' + m.value + '\n\n';
-        });
-        return { content: [{ type: 'text', text: output }] };
+
+        triggerAutoStore(apiKey, name, args.query, resultText);
+        return { content: [{ type: 'text', text: resultText }] };
       }
 
       case 'memory_store': {
-        const { category, key, value, tags, source, relevantDate } = args;
+        const { category, key, value, tags, source, relevantDate, domain, anchor } = args;
         const body = { category, key, value };
         if (tags) body.tags = tags;
         if (source) body.source = source;
         if (relevantDate) body.relevantDate = relevantDate;
+        if (domain) body.domain = domain;
+        if (anchor !== undefined) body.anchor = anchor;
+
         await apiCall(apiKey, 'POST', '/api/memory', body);
-        return { content: [{ type: 'text', text: 'Stored [' + category + '] ' + key + (relevantDate ? ' (relevant: ' + relevantDate + ')' : '') }] };
+
+        let confirmation = 'Stored [' + category + '] ' + key;
+        if (anchor && domain) confirmation += ' ⚓ (dormant, surfaces in ' + domain + ' context)';
+        else if (relevantDate) confirmation += ' (relevant: ' + relevantDate + ')';
+
+        triggerAutoStore(apiKey, name, key, value);
+        return { content: [{ type: 'text', text: confirmation }] };
+      }
+
+      case 'memory_delete': {
+        const { category, key } = args;
+        const endpoint = '/api/memory?category=' + encodeURIComponent(category) + '&key=' + encodeURIComponent(key);
+        result = await apiCall(apiKey, 'DELETE', endpoint);
+        resultText = result.deleted ? 'Deleted [' + category + '] ' + key : 'Memory not found: [' + category + '] ' + key;
+        return { content: [{ type: 'text', text: resultText }] };
       }
 
       case 'enrich': {
-        const result = await apiCall(apiKey, 'POST', '/api/enrich', { message: args.message });
+        result = await apiCall(apiKey, 'POST', '/api/enrich', { message: args.message });
         if (!result.enriched) {
-          return { content: [{ type: 'text', text: 'No relevant context found for: ' + result.entities.join(', ') }] };
+          return { content: [{ type: 'text', text: 'No relevant context found.' }] };
         }
         return { content: [{ type: 'text', text: result.contextBlock }] };
       }
 
       case 'project_get': {
-        const result = await apiCall(apiKey, 'GET', '/api/project/' + encodeURIComponent(args.name));
-        if (!result.project) {
-          return { content: [{ type: 'text', text: 'Project not found.' }] };
+        result = await apiCall(apiKey, 'GET', '/api/projects');
+        const project = result.projects?.find(p => p.name.toLowerCase() === args.name.toLowerCase());
+        if (!project) {
+          resultText = 'Project "' + args.name + '" not found.';
+        } else {
+          let output = 'Project: ' + project.name + '\n';
+          output += 'Status: ' + (project.status || 'active') + '\n';
+          if (project.description) output += 'Description: ' + project.description + '\n';
+          if (project.basePath) output += 'Path: ' + project.basePath + '\n';
+          resultText = output;
         }
-        const p = result.project;
-        let output = 'Project: ' + p.name + '\nStatus: ' + (p.status || 'active') + '\n';
-        if (p.description) output += 'Description: ' + p.description + '\n';
-        if (p.basePath) output += 'Path: ' + p.basePath + '\n';
-        return { content: [{ type: 'text', text: output }] };
+        triggerAutoStore(apiKey, name, args.name, resultText);
+        return { content: [{ type: 'text', text: resultText }] };
+      }
+
+      case 'ingest': {
+        const { content, source_type, source, speaker, session_id, turn_index, timestamp, client, metadata } = args;
+        const body = { content, source_type };
+        if (source !== undefined) body.source = source;
+        if (speaker !== undefined) body.speaker = speaker;
+        if (session_id !== undefined) body.session_id = session_id;
+        if (turn_index !== undefined) body.turn_index = turn_index;
+        if (timestamp !== undefined) body.timestamp = timestamp;
+        if (client !== undefined) body.client = client;
+        if (metadata !== undefined) body.metadata = metadata;
+
+        result = await apiCall(apiKey, 'POST', '/api/ingest', body);
+
+        const dupNote = result.duplicate ? ' [duplicate — already stored]' : '';
+        const chunkNote = result.chunk_count > 1 ? ` (chunked into ${result.chunk_count})` : '';
+        const embedNote = result.embedded ? '' : ' [embedding pending]';
+        resultText = `Ingested ${result.object_id}${chunkNote}${dupNote}${embedNote}`;
+
+        // Do NOT call triggerAutoStore on ingest (skipped internally).
+        return { content: [{ type: 'text', text: resultText }] };
       }
 
       default:
         return { content: [{ type: 'text', text: 'Unknown tool: ' + name }], isError: true };
     }
   } catch (error) {
-    // GRACEFUL DEGRADATION — don't crash, inform and continue
     console.error('Tool error [' + name + ']:', error.message);
     return degradedResponse(name, error.message);
   }
@@ -250,34 +575,42 @@ function createServer(apiKey) {
   return server;
 }
 
-// Health check — now shows API health status
 app.get('/health', (req, res) => {
-  res.json({ 
+  const now = getNow();
+  res.json({
     status: apiHealthy ? 'ok' : 'degraded',
-    version: VERSION, 
-    tools: 4, 
-    brain: 'RESILIENT CORE',
-    apiHealthy,
-    note: apiHealthy ? 'All systems operational' : 'API degraded — graceful fallback active'
+    version: VERSION,
+    tools: TOOLS.length,
+    brain: 'INGEST + AUTH HARDENING',
+    now: now.short,
+    timezone: now.timezone,
+    apiHealthy
   });
 });
 
-// SSE endpoint
+// GET /sse — SSE connection entrypoint. v4.9.0: validates key before opening stream.
 app.get('/sse', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'API key required' });
+
+  const valid = await validateApiKey(apiKey);
+  if (!valid) return res.status(401).json({ error: 'Invalid API key' });
+
   const server = createServer(apiKey);
   const transport = new SSEServerTransport('/messages', res);
   await server.connect(transport);
 });
 
-// Message endpoint for SSE
 app.post('/messages', (req, res) => res.json({ ok: true }));
 
-// Streamable HTTP endpoint
+// POST /mcp — Streamable HTTP entrypoint. v4.9.0: validates key before creating transport.
 app.post('/mcp', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+
+  const valid = await validateApiKey(apiKey);
+  if (!valid) return res.status(401).json({ error: 'invalid_api_key' });
+
   try {
     const server = createServer(apiKey);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -288,10 +621,14 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// Also accept POST on /sse for streamable HTTP
+// POST /sse — alternate Streamable HTTP entrypoint. v4.9.0: validates key.
 app.post('/sse', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
+
+  const valid = await validateApiKey(apiKey);
+  if (!valid) return res.status(401).json({ error: 'invalid_api_key' });
+
   try {
     const server = createServer(apiKey);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -303,6 +640,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — RESILIENT CORE — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — INGEST + AUTH HARDENING — on port ' + PORT));
 
 export default app;
