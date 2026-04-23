@@ -1,38 +1,50 @@
 /**
- * STCKY MCP SSE Server v4.9.1 — OBJECTS-IN-RECALL FIX
+ * STCKY MCP SSE Server v4.10.0 — RUNG 1 TRANSPARENT AUTO-CAPTURE
+ *
+ * CHANGELOG v4.10.0:
+ * - ADDED: transparent auto-capture of all tool calls at the MCP layer. Every
+ *   tool invocation fires a start event + completion event (or failure event)
+ *   to /api/ingest, linked by call_id, fire-and-forget. Claude no longer has
+ *   to consciously call ingest for tool interactions; the substrate sees them
+ *   automatically. This is Rung 1 of Chaos's blob-substrate transition ladder.
+ * - ADDED: session_id per MCP connection. Generated at connection open,
+ *   keyed by apiKey in sessionCache. Resets on reconnect.
+ * - ADDED: X-Agent-Identity header support at connection open. Clients may
+ *   identify themselves (e.g. "claude-opus-4.7", "claude-ipad",
+ *   "chatgpt-gpt-stcky-memory"). Unknown clients tagged "claude-unknown".
+ * - ADDED: event fingerprint (sha256 prefix of tool+normalized-args) for
+ *   dedupe analytics without collapsing repeated real actions.
+ * - NOTE: 'ingest' tool itself is excluded from auto-capture (avoids recursion).
+ * - NOTE: get_now is captured but flagged noisy=true so retrieval can
+ *   downrank activity-heartbeat events by default.
  *
  * CHANGELOG v4.9.1:
  * - FIX: associative_recall now surfaces objects collection alongside memories.
- *   Was dropping result.objects on the floor, leaving ingested content unreachable
- *   via recall despite objects_vector_index being live.
  *
  * CHANGELOG v4.9.0:
  * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP
- *   connection. Closes Apr 18 P0 bug where any non-empty string passed auth.
- *   Validation cached for 60s per key to avoid hammering the upstream API.
+ *   connection. Closes Apr 18 P0 bug.
  * - ADDED: ingest — POST to /api/ingest for content-addressed immutable capture.
- *   This is the cross-platform primitive that makes auto-capture possible.
  * - CHANGED: Default API_URL fallback is now https://api.stcky.ai (canonical).
- *   STCKY_API_URL env var still overrides if set.
  *
  * CHANGELOG v4.8.0:
- * - ADDED: get_now — returns current time in user's timezone
- * - ADDED: set_timezone — update user's timezone preference
+ * - ADDED: get_now, set_timezone
  *
  * CHANGELOG v4.7.0:
- * - ADDED: memory_delete — remove memories by category + key
+ * - ADDED: memory_delete
  *
  * CORE TOOLS (8):
- * 1. get_now — current time awareness (CALL FIRST)
+ * 1. get_now — current time awareness
  * 2. associative_recall — semantic + temporal retrieval (PRIMARY)
  * 3. memory_store — save curated memories
  * 4. memory_delete — remove memories by category + key
  * 5. enrich — entity extraction + cluster activation
  * 6. project_get — project context
  * 7. set_timezone — update user's timezone
- * 8. ingest — content-addressed raw capture (auto-capture primitive, v4.9.0)
+ * 8. ingest — content-addressed raw capture (autonomic at MCP layer as of v4.10.0)
  */
 import express from 'express';
+import crypto from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -45,17 +57,20 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.9.1';
+const VERSION = '4.10.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
 const timezoneCache = new Map();
 
-// Cache validated API keys. Map<apiKey, { valid: boolean, expiresAt: number }>.
-// 60s TTL — short enough that revoked keys are locked out quickly, long enough
-// to keep per-request overhead off the hot path.
+// Cache validated API keys. 60s TTL.
 const authCache = new Map();
 const AUTH_CACHE_TTL_MS = 60_000;
+
+// Session cache: apiKey → { session_id, opened_at, agent_id }.
+// Populated at connection open (GET /sse, POST /mcp, POST /sse).
+// Used by handleTool to tag auto-capture events with session + agent identity.
+const sessionCache = new Map();
 
 let apiHealthy = true;
 let lastHealthCheck = 0;
@@ -69,19 +84,22 @@ function getApiKey(req) {
   return req.query.apiKey || req.query.api_key;
 }
 
+function getAgentIdentity(req) {
+  // Case-insensitive header lookup. Express lowercases by default, but be safe.
+  return req.headers['x-agent-identity']
+      || req.headers['X-Agent-Identity']
+      || null;
+}
+
 /**
  * Validate an API key by calling api.stcky.ai/api/me.
- * Returns true if the upstream returns 200 (key is valid), false otherwise.
- * Cached for 60s per key.
  */
 async function validateApiKey(apiKey) {
   if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 8) return false;
 
   const cached = authCache.get(apiKey);
   const now = Date.now();
-  if (cached && cached.expiresAt > now) {
-    return cached.valid;
-  }
+  if (cached && cached.expiresAt > now) return cached.valid;
 
   let valid = false;
   try {
@@ -94,14 +112,11 @@ async function validateApiKey(apiKey) {
     valid = response.ok;
   } catch (err) {
     console.error('[AUTH] Validation fetch failed:', err.message);
-    // On network failure we deliberately fail-closed. Better a false negative
-    // (user retries) than a false positive (unauth'd connection).
     valid = false;
   }
 
   authCache.set(apiKey, { valid, expiresAt: now + AUTH_CACHE_TTL_MS });
 
-  // Opportunistic cache cleanup so the Map doesn't grow unbounded in long-running processes.
   if (authCache.size > 1000) {
     for (const [k, v] of authCache.entries()) {
       if (v.expiresAt <= now) authCache.delete(k);
@@ -109,6 +124,29 @@ async function validateApiKey(apiKey) {
   }
 
   return valid;
+}
+
+/**
+ * Initialize or refresh a session entry for a connection. Called at connection
+ * open by each entrypoint. Replaces any prior session under the same apiKey
+ * (last-connection-wins for multi-client scenarios — acceptable for v0.1).
+ */
+function initSession(apiKey, agentIdentity) {
+  const session_id = 'mcp-' + Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
+  sessionCache.set(apiKey, {
+    session_id,
+    opened_at: new Date().toISOString(),
+    agent_id: agentIdentity || 'claude-unknown',
+  });
+  return session_id;
+}
+
+function getSession(apiKey) {
+  return sessionCache.get(apiKey) || {
+    session_id: null,
+    opened_at: null,
+    agent_id: 'claude-unknown',
+  };
 }
 
 function formatTimestamp(isoString) {
@@ -122,9 +160,7 @@ function formatTimestamp(isoString) {
 // TEMPORAL AWARENESS — v4.8.0
 // =============================================================================
 async function getUserTimezone(apiKey) {
-  if (timezoneCache.has(apiKey)) {
-    return timezoneCache.get(apiKey);
-  }
+  if (timezoneCache.has(apiKey)) return timezoneCache.get(apiKey);
 
   try {
     const response = await fetch(API_URL + '/api/me', {
@@ -133,7 +169,6 @@ async function getUserTimezone(apiKey) {
         'Content-Type': 'application/json'
       }
     });
-
     if (response.ok) {
       const data = await response.json();
       const tz = data.timezone || DEFAULT_TIMEZONE;
@@ -143,47 +178,25 @@ async function getUserTimezone(apiKey) {
   } catch (error) {
     console.error('[TIMEZONE] Failed to fetch user timezone:', error.message);
   }
-
   return DEFAULT_TIMEZONE;
 }
 
 function getNow(timezone = DEFAULT_TIMEZONE) {
   const now = new Date();
-
   try {
     const options = {
-      timeZone: timezone,
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true
+      timeZone: timezone, weekday: 'long', year: 'numeric',
+      month: 'long', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', hour12: true
     };
-
     const formatted = now.toLocaleString('en-US', options);
-
     const shortOptions = {
-      timeZone: timezone,
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true
+      timeZone: timezone, month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', hour12: true
     };
     const short = now.toLocaleString('en-US', shortOptions);
-
     const tzOffset = now.toLocaleString('en-US', { timeZone: timezone, timeZoneName: 'short' }).split(' ').pop();
-
-    return {
-      iso: now.toISOString(),
-      formatted,
-      short,
-      timezone,
-      tzOffset,
-      unix: now.getTime()
-    };
+    return { iso: now.toISOString(), formatted, short, timezone, tzOffset, unix: now.getTime() };
   } catch (e) {
     console.error('[TIMEZONE] Invalid timezone:', timezone, '- falling back to UTC');
     return getNow(DEFAULT_TIMEZONE);
@@ -191,12 +204,92 @@ function getNow(timezone = DEFAULT_TIMEZONE) {
 }
 
 // =============================================================================
-// AUTO-STORE ENFORCEMENT
+// TRANSPARENT AUTO-CAPTURE — v4.10.0 (Rung 1)
+// =============================================================================
+
+/**
+ * Deterministic fingerprint: sha256 of tool_name + normalized JSON args.
+ * Same tool + same args = same fingerprint regardless of call_id.
+ * Lets retrieval collapse obvious duplicates for analytics without losing
+ * the underlying distinct call_ids (which preserve real repeated behavior).
+ */
+function computeFingerprint(toolName, args) {
+  const sortedKeys = args ? Object.keys(args).sort() : [];
+  const normalized = JSON.stringify(args || {}, sortedKeys);
+  return crypto.createHash('sha256').update(toolName + '|' + normalized).digest('hex').slice(0, 16);
+}
+
+/**
+ * Render an auto-capture event as human-readable text for semantic search.
+ * Machine-readable structured data goes in metadata; this is what embedding
+ * sees, so it should be descriptive.
+ */
+function renderEventAsText(evt) {
+  const actor = evt.agent_id || 'claude';
+  if (evt.type === 'tool_call_started') {
+    const argsStr = (() => {
+      try { return JSON.stringify(evt.args || {}).slice(0, 500); }
+      catch { return '[unserializable args]'; }
+    })();
+    return `[${actor}] called ${evt.tool_name} with args: ${argsStr}`;
+  }
+  if (evt.type === 'tool_call_completed') {
+    const snip = (evt.result_snippet || '').toString().slice(0, 1000);
+    return `[${actor}] ${evt.tool_name} returned in ${evt.duration_ms}ms: ${snip}`;
+  }
+  if (evt.type === 'tool_call_failed') {
+    return `[${actor}] ${evt.tool_name} failed after ${evt.duration_ms}ms: ${evt.error}`;
+  }
+  return `[${actor}] ${evt.type}: ${evt.tool_name}`;
+}
+
+/**
+ * Fire-and-forget auto-capture. Never blocks the tool call. Failures log
+ * but do not propagate to the caller.
+ */
+function fireAutoCaptureEvent(apiKey, evt) {
+  // Recursion guard — never auto-capture an ingest call.
+  if (evt.tool_name === 'ingest') return;
+
+  const session = getSession(apiKey);
+  const body = {
+    content: renderEventAsText(evt),
+    source_type: 'tool_event',
+    source: 'mcp-sse.auto-capture.v' + VERSION,
+    session_id: evt.session_id || session.session_id || null,
+    speaker: evt.agent_id || session.agent_id || 'claude-unknown',
+    timestamp: evt.timestamp,
+    metadata: {
+      event_type: evt.type,
+      call_id: evt.call_id,
+      parent_call_id: evt.parent_call_id || null,
+      tool_name: evt.tool_name,
+      args: evt.args,
+      result_snippet: evt.result_snippet,
+      duration_ms: evt.duration_ms,
+      error: evt.error,
+      noisy: !!evt.noisy,
+      fingerprint: evt.fingerprint,
+    },
+  };
+
+  // Intentionally not awaited. Failures logged, never thrown.
+  fetch(API_URL + '/api/ingest', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  }).catch(err => {
+    console.error('[AUTO-CAPTURE] ingest failed for ' + evt.type + ' ' + evt.tool_name + ':', err.message);
+  });
+}
+
+// =============================================================================
+// LEGACY AUTO-STORE (pre-v4.10.0 — curated enrich-based, kept for back-compat)
 // =============================================================================
 async function triggerAutoStore(apiKey, toolName, toolInput, toolResult) {
-  // Skip tools that don't produce memory-worthy content, and skip ingest itself
-  // (it's already the auto-capture primitive — routing its own calls back through
-  // enrich would create a feedback loop).
   if (
     toolName === 'enrich' ||
     toolName === 'get_now' ||
@@ -298,15 +391,11 @@ const TOOLS = [
   {
     name: 'get_now',
     description: 'Get current time in user\'s timezone. Call this to know what time it is NOW. Essential for temporal awareness.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      required: []
-    }
+    inputSchema: { type: 'object', properties: {}, required: [] }
   },
   {
     name: 'associative_recall',
-    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Returns both curated memories and raw ingested objects (conversation turns, documents, etc).',
+    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Returns both curated memories and raw ingested objects (conversation turns, documents, tool events).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -355,9 +444,7 @@ const TOOLS = [
     description: 'Extract entities and retrieve relevant memory clusters. Detects domain context and surfaces dormant anchors.',
     inputSchema: {
       type: 'object',
-      properties: {
-        message: { type: 'string', description: 'The message to analyze' }
-      },
+      properties: { message: { type: 'string', description: 'The message to analyze' } },
       required: ['message']
     }
   },
@@ -366,38 +453,34 @@ const TOOLS = [
     description: 'Get full details for a specific project by name.',
     inputSchema: {
       type: 'object',
-      properties: {
-        name: { type: 'string', description: 'Project name' }
-      },
+      properties: { name: { type: 'string', description: 'Project name' } },
       required: ['name']
     }
   },
   {
     name: 'set_timezone',
-    description: 'Update user\'s timezone preference. Use IANA timezone names (e.g., America/Los_Angeles, Europe/London, Asia/Tokyo).',
+    description: 'Update user\'s timezone preference. Use IANA timezone names (e.g., America/Los_Angeles).',
     inputSchema: {
       type: 'object',
-      properties: {
-        timezone: { type: 'string', description: 'IANA timezone name' }
-      },
+      properties: { timezone: { type: 'string', description: 'IANA timezone name' } },
       required: ['timezone']
     }
   },
   {
     name: 'ingest',
-    description: 'Capture raw content into content-addressed immutable storage. This is the auto-capture primitive — call at the end of every substantive conversation turn with a concatenation of the user message, assistant response, and brief tool summary. One object per turn. Same content posted twice is deduplicated (idempotent via SHA-256). Unlike memory_store, ingest does not require curation — it is the raw ledger.',
+    description: 'Capture raw content into content-addressed immutable storage. As of v4.10.0, the MCP server ALSO auto-captures every tool call as a tool_event — manual ingest is still available for conversation turns (user utterance + assistant response) which do not pass through MCP, but it is no longer required for tool activity.',
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: 'Raw content to store. Required, non-empty.' },
-        source_type: { type: 'string', description: 'Content classification: conversation | document | email | audio_transcript | file_upload | extracted_statement' },
-        source: { type: 'string', description: 'Optional. provider.interface.conversation_id format, e.g. "claude.web.stcky-build-2026-04-22"' },
-        speaker: { type: 'string', description: 'Optional. Who authored the turn: "steven", "claude", "chaos", etc.' },
-        session_id: { type: 'string', description: 'Optional. Session identifier for grouping related turns.' },
-        turn_index: { type: 'number', description: 'Optional. Incrementing integer within a session, starting at 1.' },
-        timestamp: { type: 'string', description: 'Optional ISO timestamp for when the content was authored. Defaults to server now.' },
-        client: { type: 'string', description: 'Optional interface tag: "web" | "ios" | "ipad" | "desktop" | "api"' },
-        metadata: { type: 'object', description: 'Optional free-form metadata. Stored but not indexed in v0.1.' }
+        content: { type: 'string', description: 'Raw content to store.' },
+        source_type: { type: 'string', description: 'conversation | document | email | audio_transcript | file_upload | extracted_statement | tool_event' },
+        source: { type: 'string' },
+        speaker: { type: 'string' },
+        session_id: { type: 'string' },
+        turn_index: { type: 'number' },
+        timestamp: { type: 'string' },
+        client: { type: 'string' },
+        metadata: { type: 'object' }
       },
       required: ['content', 'source_type']
     }
@@ -405,10 +488,32 @@ const TOOLS = [
 ];
 
 // =============================================================================
-// TOOL HANDLERS
+// TOOL HANDLERS (with transparent auto-capture wrapper)
 // =============================================================================
 async function handleTool(apiKey, name, args) {
   checkApiHealth(apiKey);
+
+  // Rung 1: transparent auto-capture. Generate call_id, fire start event.
+  const call_id = 'call-' + crypto.randomUUID();
+  const start_ts = new Date().toISOString();
+  const start_hrtime = Date.now();
+  const session = getSession(apiKey);
+  const fingerprint = computeFingerprint(name, args);
+  const noisy = (name === 'get_now');
+
+  if (name !== 'ingest') {
+    fireAutoCaptureEvent(apiKey, {
+      type: 'tool_call_started',
+      call_id,
+      tool_name: name,
+      args,
+      timestamp: start_ts,
+      session_id: session.session_id,
+      agent_id: session.agent_id,
+      noisy,
+      fingerprint,
+    });
+  }
 
   try {
     let result;
@@ -419,18 +524,17 @@ async function handleTool(apiKey, name, args) {
         const timezone = await getUserTimezone(apiKey);
         const now = getNow(timezone);
         resultText = `NOW: ${now.formatted}\nTimezone: ${now.timezone} (${now.tzOffset})\nISO: ${now.iso}`;
-        return { content: [{ type: 'text', text: resultText }] };
+        break;
       }
 
       case 'set_timezone': {
         const { timezone } = args;
-
         try {
           Intl.DateTimeFormat(undefined, { timeZone: timezone });
         } catch (e) {
-          return { content: [{ type: 'text', text: 'Invalid timezone: ' + timezone + '. Use IANA format (e.g., America/Los_Angeles)' }] };
+          resultText = 'Invalid timezone: ' + timezone + '. Use IANA format (e.g., America/Los_Angeles)';
+          break;
         }
-
         const response = await fetch(API_URL + '/api/me', {
           method: 'PUT',
           headers: {
@@ -439,7 +543,6 @@ async function handleTool(apiKey, name, args) {
           },
           body: JSON.stringify({ timezone })
         });
-
         if (response.ok) {
           timezoneCache.set(apiKey, timezone);
           const now = getNow(timezone);
@@ -447,8 +550,7 @@ async function handleTool(apiKey, name, args) {
         } else {
           resultText = 'Failed to update timezone.';
         }
-
-        return { content: [{ type: 'text', text: resultText }] };
+        break;
       }
 
       case 'associative_recall': {
@@ -497,7 +599,7 @@ async function handleTool(apiKey, name, args) {
         }
 
         triggerAutoStore(apiKey, name, args.query, resultText);
-        return { content: [{ type: 'text', text: resultText }] };
+        break;
       }
 
       case 'memory_store': {
@@ -516,7 +618,8 @@ async function handleTool(apiKey, name, args) {
         else if (relevantDate) confirmation += ' (relevant: ' + relevantDate + ')';
 
         triggerAutoStore(apiKey, name, key, value);
-        return { content: [{ type: 'text', text: confirmation }] };
+        resultText = confirmation;
+        break;
       }
 
       case 'memory_delete': {
@@ -524,15 +627,17 @@ async function handleTool(apiKey, name, args) {
         const endpoint = '/api/memory?category=' + encodeURIComponent(category) + '&key=' + encodeURIComponent(key);
         result = await apiCall(apiKey, 'DELETE', endpoint);
         resultText = result.deleted ? 'Deleted [' + category + '] ' + key : 'Memory not found: [' + category + '] ' + key;
-        return { content: [{ type: 'text', text: resultText }] };
+        break;
       }
 
       case 'enrich': {
         result = await apiCall(apiKey, 'POST', '/api/enrich', { message: args.message });
         if (!result.enriched) {
-          return { content: [{ type: 'text', text: 'No relevant context found.' }] };
+          resultText = 'No relevant context found.';
+        } else {
+          resultText = result.contextBlock;
         }
-        return { content: [{ type: 'text', text: result.contextBlock }] };
+        break;
       }
 
       case 'project_get': {
@@ -548,7 +653,7 @@ async function handleTool(apiKey, name, args) {
           resultText = output;
         }
         triggerAutoStore(apiKey, name, args.name, resultText);
-        return { content: [{ type: 'text', text: resultText }] };
+        break;
       }
 
       case 'ingest': {
@@ -568,16 +673,65 @@ async function handleTool(apiKey, name, args) {
         const chunkNote = result.chunk_count > 1 ? ` (chunked into ${result.chunk_count})` : '';
         const embedNote = result.embedded ? '' : ' [embedding pending]';
         resultText = `Ingested ${result.object_id}${chunkNote}${dupNote}${embedNote}`;
-
-        // Do NOT call triggerAutoStore on ingest (skipped internally).
-        return { content: [{ type: 'text', text: resultText }] };
+        // NOTE: ingest is excluded from auto-capture above to prevent recursion.
+        break;
       }
 
-      default:
+      default: {
+        const duration_ms = Date.now() - start_hrtime;
+        fireAutoCaptureEvent(apiKey, {
+          type: 'tool_call_failed',
+          call_id,
+          parent_call_id: call_id,
+          tool_name: name,
+          error: 'Unknown tool: ' + name,
+          duration_ms,
+          timestamp: new Date().toISOString(),
+          session_id: session.session_id,
+          agent_id: session.agent_id,
+          fingerprint,
+        });
         return { content: [{ type: 'text', text: 'Unknown tool: ' + name }], isError: true };
+      }
     }
+
+    // Fire completion event (success path). Excluded for ingest to avoid recursion.
+    if (name !== 'ingest') {
+      fireAutoCaptureEvent(apiKey, {
+        type: 'tool_call_completed',
+        call_id,
+        parent_call_id: call_id,
+        tool_name: name,
+        result_snippet: (resultText || '').slice(0, 2000),
+        duration_ms: Date.now() - start_hrtime,
+        timestamp: new Date().toISOString(),
+        session_id: session.session_id,
+        agent_id: session.agent_id,
+        noisy,
+        fingerprint,
+      });
+    }
+
+    return { content: [{ type: 'text', text: resultText }] };
+
   } catch (error) {
     console.error('Tool error [' + name + ']:', error.message);
+
+    if (name !== 'ingest') {
+      fireAutoCaptureEvent(apiKey, {
+        type: 'tool_call_failed',
+        call_id,
+        parent_call_id: call_id,
+        tool_name: name,
+        error: error.message,
+        duration_ms: Date.now() - start_hrtime,
+        timestamp: new Date().toISOString(),
+        session_id: session.session_id,
+        agent_id: session.agent_id,
+        fingerprint,
+      });
+    }
+
     return degradedResponse(name, error.message);
   }
 }
@@ -606,20 +760,23 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'OBJECTS-IN-RECALL FIX',
+    brain: 'RUNG 1 TRANSPARENT AUTO-CAPTURE',
     now: now.short,
     timezone: now.timezone,
-    apiHealthy
+    apiHealthy,
+    sessions: sessionCache.size,
   });
 });
 
-// GET /sse — SSE connection entrypoint. v4.9.0: validates key before opening stream.
+// GET /sse — SSE entrypoint. Seeds sessionCache + captures agent identity.
 app.get('/sse', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'API key required' });
 
   const valid = await validateApiKey(apiKey);
   if (!valid) return res.status(401).json({ error: 'Invalid API key' });
+
+  initSession(apiKey, getAgentIdentity(req));
 
   const server = createServer(apiKey);
   const transport = new SSEServerTransport('/messages', res);
@@ -628,13 +785,14 @@ app.get('/sse', async (req, res) => {
 
 app.post('/messages', (req, res) => res.json({ ok: true }));
 
-// POST /mcp — Streamable HTTP entrypoint. v4.9.0: validates key before creating transport.
 app.post('/mcp', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
 
   const valid = await validateApiKey(apiKey);
   if (!valid) return res.status(401).json({ error: 'invalid_api_key' });
+
+  initSession(apiKey, getAgentIdentity(req));
 
   try {
     const server = createServer(apiKey);
@@ -646,13 +804,14 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// POST /sse — alternate Streamable HTTP entrypoint. v4.9.0: validates key.
 app.post('/sse', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'unauthorized' });
 
   const valid = await validateApiKey(apiKey);
   if (!valid) return res.status(401).json({ error: 'invalid_api_key' });
+
+  initSession(apiKey, getAgentIdentity(req));
 
   try {
     const server = createServer(apiKey);
@@ -665,6 +824,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — OBJECTS-IN-RECALL FIX — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — RUNG 1 TRANSPARENT AUTO-CAPTURE — on port ' + PORT));
 
 export default app;
