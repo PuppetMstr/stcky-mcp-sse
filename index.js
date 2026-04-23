@@ -1,5 +1,10 @@
 /**
- * STCKY MCP SSE Server v4.9.0 — INGEST + AUTH HARDENING
+ * STCKY MCP SSE Server v4.9.1 — OBJECTS-IN-RECALL FIX
+ *
+ * CHANGELOG v4.9.1:
+ * - FIX: associative_recall now surfaces objects collection alongside memories.
+ *   Was dropping result.objects on the floor, leaving ingested content unreachable
+ *   via recall despite objects_vector_index being live.
  *
  * CHANGELOG v4.9.0:
  * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP
@@ -40,7 +45,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.9.0';
+const VERSION = '4.9.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -301,7 +306,7 @@ const TOOLS = [
   },
   {
     name: 'associative_recall',
-    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher.',
+    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Returns both curated memories and raw ingested objects (conversation turns, documents, etc).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -456,18 +461,38 @@ async function handleTool(apiKey, name, args) {
 
         let output = `NOW: ${now.short} (${now.timezone})\n\n`;
 
-        if (!result.memories || result.memories.length === 0) {
-          resultText = output + 'No related memories found.';
+        const hasMemories = result.memories && result.memories.length > 0;
+        const hasObjects  = result.objects  && result.objects.length  > 0;
+
+        if (!hasMemories && !hasObjects) {
+          resultText = output + 'No related memories or objects found.';
         } else {
-          output += result.memories.length + ' related memories:\n\n';
-          result.memories.forEach((m, i) => {
-            const ts = formatTimestamp(m.updatedAt || m.createdAt);
-            const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
-            const anchor = m.anchor ? ' ⚓' : '';
-            const domain = m.domain ? ' [' + m.domain + ']' : '';
-            output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
-            output += '   ' + m.value + '\n\n';
-          });
+          if (hasMemories) {
+            output += result.memories.length + ' related memories:\n\n';
+            result.memories.forEach((m, i) => {
+              const ts = formatTimestamp(m.updatedAt || m.createdAt);
+              const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
+              const anchor = m.anchor ? ' ⚓' : '';
+              const domain = m.domain ? ' [' + m.domain + ']' : '';
+              output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
+              output += '   ' + m.value + '\n\n';
+            });
+          }
+
+          if (hasObjects) {
+            if (hasMemories) output += '\n';
+            output += result.objects.length + ' related objects (raw ingested content):\n\n';
+            result.objects.forEach((o, i) => {
+              const ts = formatTimestamp(o.timestamp || o.ingested_at);
+              const src = o.source ? ' [' + o.source + ']' : '';
+              const spk = o.speaker ? ' (' + o.speaker + ')' : '';
+              const turn = (o.turn_index !== null && o.turn_index !== undefined) ? ' turn ' + o.turn_index : '';
+              output += (i + 1) + '. ' + (o.source_type || 'object') + src + spk + turn + (ts ? ' (' + ts + ')' : '') + '\n';
+              const snippet = (o.content || '').slice(0, 500);
+              output += '   ' + snippet + (o.content && o.content.length > 500 ? '...' : '') + '\n\n';
+            });
+          }
+
           resultText = output;
         }
 
@@ -581,7 +606,7 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'INGEST + AUTH HARDENING',
+    brain: 'OBJECTS-IN-RECALL FIX',
     now: now.short,
     timezone: now.timezone,
     apiHealthy
@@ -640,6 +665,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — INGEST + AUTH HARDENING — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — OBJECTS-IN-RECALL FIX — on port ' + PORT));
 
 export default app;
