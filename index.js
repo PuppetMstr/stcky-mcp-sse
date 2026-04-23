@@ -1,31 +1,33 @@
 /**
- * STCKY MCP SSE Server v4.10.0 — RUNG 1 TRANSPARENT AUTO-CAPTURE
+ * STCKY MCP SSE Server v4.11.0 — RUNG 2: TIME IN EVERY RESPONSE
+ *
+ * CHANGELOG v4.11.0:
+ * - ADDED: NOW prefix ("NOW: Apr 23, 10:05 AM (America/Los_Angeles)\n\n") on
+ *   EVERY tool response except get_now (which already carries full time).
+ *   Model no longer needs a standalone time call — time comes free with any
+ *   recall, store, ingest, or other tool activity.
+ * - DEPRECATED: get_now tool description updated to note that time is now
+ *   included in every tool response; get_now kept for backward compatibility
+ *   with existing protocols but no longer the primary way to know the time.
+ * - This is Rung 2 of Chaos's blob-substrate transition ladder.
+ * - REFACTORED: NOW prefix construction unified in handleTool wrapper.
+ *   associative_recall no longer builds its own NOW line (dedup).
  *
  * CHANGELOG v4.10.0:
  * - ADDED: transparent auto-capture of all tool calls at the MCP layer. Every
  *   tool invocation fires a start event + completion event (or failure event)
- *   to /api/ingest, linked by call_id, fire-and-forget. Claude no longer has
- *   to consciously call ingest for tool interactions; the substrate sees them
- *   automatically. This is Rung 1 of Chaos's blob-substrate transition ladder.
- * - ADDED: session_id per MCP connection. Generated at connection open,
- *   keyed by apiKey in sessionCache. Resets on reconnect.
- * - ADDED: X-Agent-Identity header support at connection open. Clients may
- *   identify themselves (e.g. "claude-opus-4.7", "claude-ipad",
- *   "chatgpt-gpt-stcky-memory"). Unknown clients tagged "claude-unknown".
- * - ADDED: event fingerprint (sha256 prefix of tool+normalized-args) for
- *   dedupe analytics without collapsing repeated real actions.
- * - NOTE: 'ingest' tool itself is excluded from auto-capture (avoids recursion).
- * - NOTE: get_now is captured but flagged noisy=true so retrieval can
- *   downrank activity-heartbeat events by default.
+ *   to /api/ingest, linked by call_id, fire-and-forget.
+ * - ADDED: session_id per MCP connection, X-Agent-Identity header support,
+ *   event fingerprint.
  *
  * CHANGELOG v4.9.1:
  * - FIX: associative_recall now surfaces objects collection alongside memories.
  *
  * CHANGELOG v4.9.0:
  * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP
- *   connection. Closes Apr 18 P0 bug.
- * - ADDED: ingest — POST to /api/ingest for content-addressed immutable capture.
- * - CHANGED: Default API_URL fallback is now https://api.stcky.ai (canonical).
+ *   connection.
+ * - ADDED: ingest tool.
+ * - CHANGED: Default API_URL fallback is now https://api.stcky.ai.
  *
  * CHANGELOG v4.8.0:
  * - ADDED: get_now, set_timezone
@@ -34,14 +36,14 @@
  * - ADDED: memory_delete
  *
  * CORE TOOLS (8):
- * 1. get_now — current time awareness
- * 2. associative_recall — semantic + temporal retrieval (PRIMARY)
- * 3. memory_store — save curated memories
- * 4. memory_delete — remove memories by category + key
- * 5. enrich — entity extraction + cluster activation
- * 6. project_get — project context
- * 7. set_timezone — update user's timezone
- * 8. ingest — content-addressed raw capture (autonomic at MCP layer as of v4.10.0)
+ * 1. get_now — DEPRECATED as of v4.11.0 (time now in every response); kept for back-compat
+ * 2. associative_recall — semantic + temporal retrieval (PRIMARY, time-aware)
+ * 3. memory_store — save curated memories (time-aware response)
+ * 4. memory_delete — remove memories by category + key (time-aware response)
+ * 5. enrich — entity extraction + cluster activation (time-aware response)
+ * 6. project_get — project context (time-aware response)
+ * 7. set_timezone — update user's timezone (time-aware response)
+ * 8. ingest — content-addressed raw capture, autonomic at MCP layer (time-aware response)
  */
 import express from 'express';
 import crypto from 'crypto';
@@ -57,7 +59,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.10.0';
+const VERSION = '4.11.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -68,8 +70,6 @@ const authCache = new Map();
 const AUTH_CACHE_TTL_MS = 60_000;
 
 // Session cache: apiKey → { session_id, opened_at, agent_id }.
-// Populated at connection open (GET /sse, POST /mcp, POST /sse).
-// Used by handleTool to tag auto-capture events with session + agent identity.
 const sessionCache = new Map();
 
 let apiHealthy = true;
@@ -85,15 +85,11 @@ function getApiKey(req) {
 }
 
 function getAgentIdentity(req) {
-  // Case-insensitive header lookup. Express lowercases by default, but be safe.
   return req.headers['x-agent-identity']
       || req.headers['X-Agent-Identity']
       || null;
 }
 
-/**
- * Validate an API key by calling api.stcky.ai/api/me.
- */
 async function validateApiKey(apiKey) {
   if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 8) return false;
 
@@ -126,11 +122,6 @@ async function validateApiKey(apiKey) {
   return valid;
 }
 
-/**
- * Initialize or refresh a session entry for a connection. Called at connection
- * open by each entrypoint. Replaces any prior session under the same apiKey
- * (last-connection-wins for multi-client scenarios — acceptable for v0.1).
- */
 function initSession(apiKey, agentIdentity) {
   const session_id = 'mcp-' + Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
   sessionCache.set(apiKey, {
@@ -157,7 +148,7 @@ function formatTimestamp(isoString) {
 }
 
 // =============================================================================
-// TEMPORAL AWARENESS — v4.8.0
+// TEMPORAL AWARENESS
 // =============================================================================
 async function getUserTimezone(apiKey) {
   if (timezoneCache.has(apiKey)) return timezoneCache.get(apiKey);
@@ -203,27 +194,28 @@ function getNow(timezone = DEFAULT_TIMEZONE) {
   }
 }
 
+/**
+ * Build the NOW prefix string for a tool response. v4.11.0 Rung 2: every
+ * non-get_now tool response carries this at the top so the model never needs
+ * to call get_now separately. Uses cached timezone if available, falls back
+ * to an async fetch, ultimately UTC.
+ */
+async function buildNowPrefix(apiKey) {
+  const timezone = await getUserTimezone(apiKey);
+  const now = getNow(timezone);
+  return `NOW: ${now.short} (${now.timezone})\n\n`;
+}
+
 // =============================================================================
 // TRANSPARENT AUTO-CAPTURE — v4.10.0 (Rung 1)
 // =============================================================================
 
-/**
- * Deterministic fingerprint: sha256 of tool_name + normalized JSON args.
- * Same tool + same args = same fingerprint regardless of call_id.
- * Lets retrieval collapse obvious duplicates for analytics without losing
- * the underlying distinct call_ids (which preserve real repeated behavior).
- */
 function computeFingerprint(toolName, args) {
   const sortedKeys = args ? Object.keys(args).sort() : [];
   const normalized = JSON.stringify(args || {}, sortedKeys);
   return crypto.createHash('sha256').update(toolName + '|' + normalized).digest('hex').slice(0, 16);
 }
 
-/**
- * Render an auto-capture event as human-readable text for semantic search.
- * Machine-readable structured data goes in metadata; this is what embedding
- * sees, so it should be descriptive.
- */
 function renderEventAsText(evt) {
   const actor = evt.agent_id || 'claude';
   if (evt.type === 'tool_call_started') {
@@ -243,12 +235,7 @@ function renderEventAsText(evt) {
   return `[${actor}] ${evt.type}: ${evt.tool_name}`;
 }
 
-/**
- * Fire-and-forget auto-capture. Never blocks the tool call. Failures log
- * but do not propagate to the caller.
- */
 function fireAutoCaptureEvent(apiKey, evt) {
-  // Recursion guard — never auto-capture an ingest call.
   if (evt.tool_name === 'ingest') return;
 
   const session = getSession(apiKey);
@@ -273,7 +260,6 @@ function fireAutoCaptureEvent(apiKey, evt) {
     },
   };
 
-  // Intentionally not awaited. Failures logged, never thrown.
   fetch(API_URL + '/api/ingest', {
     method: 'POST',
     headers: {
@@ -390,12 +376,12 @@ async function checkApiHealth(apiKey) {
 const TOOLS = [
   {
     name: 'get_now',
-    description: 'Get current time in user\'s timezone. Call this to know what time it is NOW. Essential for temporal awareness.',
+    description: 'DEPRECATED as of v4.11.0 — every tool response now carries NOW time automatically. Kept for backward compatibility. Prefer calling associative_recall or any other tool instead; time comes free with every response.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   {
     name: 'associative_recall',
-    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Memories closer to NOW score higher. Returns both curated memories and raw ingested objects (conversation turns, documents, tool events).',
+    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Returns both curated memories and raw ingested objects (conversation turns, documents, tool events). Response includes current time at the top.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -407,7 +393,7 @@ const TOOLS = [
   },
   {
     name: 'memory_store',
-    description: 'Save a curated fact to persistent memory (memories collection). For raw turn-by-turn capture, use "ingest" instead. Include relevantDate for time-sensitive memories. Use domain + anchor=true for dormant facts.',
+    description: 'Save a curated fact to persistent memory (memories collection). For raw turn-by-turn capture, use "ingest" instead. Include relevantDate for time-sensitive memories. Use domain + anchor=true for dormant facts. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -429,7 +415,7 @@ const TOOLS = [
   },
   {
     name: 'memory_delete',
-    description: 'Delete a memory by category and key.',
+    description: 'Delete a memory by category and key. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -441,7 +427,7 @@ const TOOLS = [
   },
   {
     name: 'enrich',
-    description: 'Extract entities and retrieve relevant memory clusters. Detects domain context and surfaces dormant anchors.',
+    description: 'Extract entities and retrieve relevant memory clusters. Detects domain context and surfaces dormant anchors. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: { message: { type: 'string', description: 'The message to analyze' } },
@@ -450,7 +436,7 @@ const TOOLS = [
   },
   {
     name: 'project_get',
-    description: 'Get full details for a specific project by name.',
+    description: 'Get full details for a specific project by name. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: { name: { type: 'string', description: 'Project name' } },
@@ -459,7 +445,7 @@ const TOOLS = [
   },
   {
     name: 'set_timezone',
-    description: 'Update user\'s timezone preference. Use IANA timezone names (e.g., America/Los_Angeles).',
+    description: 'Update user\'s timezone preference. Use IANA timezone names (e.g., America/Los_Angeles). Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: { timezone: { type: 'string', description: 'IANA timezone name' } },
@@ -468,7 +454,7 @@ const TOOLS = [
   },
   {
     name: 'ingest',
-    description: 'Capture raw content into content-addressed immutable storage. As of v4.10.0, the MCP server ALSO auto-captures every tool call as a tool_event — manual ingest is still available for conversation turns (user utterance + assistant response) which do not pass through MCP, but it is no longer required for tool activity.',
+    description: 'Capture raw content into content-addressed immutable storage. As of v4.10.0, the MCP server ALSO auto-captures every tool call as a tool_event — manual ingest is still available for conversation turns (user utterance + assistant response) which do not pass through MCP, but it is no longer required for tool activity. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -488,12 +474,12 @@ const TOOLS = [
 ];
 
 // =============================================================================
-// TOOL HANDLERS (with transparent auto-capture wrapper)
+// TOOL HANDLERS (with transparent auto-capture wrapper + NOW prefix)
 // =============================================================================
 async function handleTool(apiKey, name, args) {
   checkApiHealth(apiKey);
 
-  // Rung 1: transparent auto-capture. Generate call_id, fire start event.
+  // Rung 1: transparent auto-capture.
   const call_id = 'call-' + crypto.randomUUID();
   const start_ts = new Date().toISOString();
   const start_hrtime = Date.now();
@@ -556,18 +542,17 @@ async function handleTool(apiKey, name, args) {
       case 'associative_recall': {
         const query = args.query;
         const limit = args.limit || 10;
-        const timezone = await getUserTimezone(apiKey);
-        const now = getNow(timezone);
 
         result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
 
-        let output = `NOW: ${now.short} (${now.timezone})\n\n`;
+        // v4.11.0: NOW prefix is added by the wrapper below — no longer built here.
+        let output = '';
 
         const hasMemories = result.memories && result.memories.length > 0;
         const hasObjects  = result.objects  && result.objects.length  > 0;
 
         if (!hasMemories && !hasObjects) {
-          resultText = output + 'No related memories or objects found.';
+          resultText = 'No related memories or objects found.';
         } else {
           if (hasMemories) {
             output += result.memories.length + ' related memories:\n\n';
@@ -673,7 +658,6 @@ async function handleTool(apiKey, name, args) {
         const chunkNote = result.chunk_count > 1 ? ` (chunked into ${result.chunk_count})` : '';
         const embedNote = result.embedded ? '' : ' [embedding pending]';
         resultText = `Ingested ${result.object_id}${chunkNote}${dupNote}${embedNote}`;
-        // NOTE: ingest is excluded from auto-capture above to prevent recursion.
         break;
       }
 
@@ -692,6 +676,18 @@ async function handleTool(apiKey, name, args) {
           fingerprint,
         });
         return { content: [{ type: 'text', text: 'Unknown tool: ' + name }], isError: true };
+      }
+    }
+
+    // v4.11.0 Rung 2: prepend NOW to every response except get_now
+    // (which already carries full time info in its own response).
+    if (name !== 'get_now') {
+      try {
+        const nowPrefix = await buildNowPrefix(apiKey);
+        resultText = nowPrefix + resultText;
+      } catch (tzError) {
+        // If timezone resolution fails, ship response without prefix rather than fail the tool.
+        console.error('[NOW-PREFIX] failed to build prefix:', tzError.message);
       }
     }
 
@@ -732,7 +728,17 @@ async function handleTool(apiKey, name, args) {
       });
     }
 
-    return degradedResponse(name, error.message);
+    // v4.11.0: prepend NOW to error response too (except for get_now).
+    const degraded = degradedResponse(name, error.message);
+    if (name !== 'get_now' && degraded.content?.[0]?.text) {
+      try {
+        const nowPrefix = await buildNowPrefix(apiKey);
+        degraded.content[0].text = nowPrefix + degraded.content[0].text;
+      } catch (tzError) {
+        console.error('[NOW-PREFIX] failed to build prefix for error response:', tzError.message);
+      }
+    }
+    return degraded;
   }
 }
 
@@ -760,7 +766,7 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'RUNG 1 TRANSPARENT AUTO-CAPTURE',
+    brain: 'TIME IN EVERY RESPONSE',
     now: now.short,
     timezone: now.timezone,
     apiHealthy,
@@ -768,7 +774,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// GET /sse — SSE entrypoint. Seeds sessionCache + captures agent identity.
 app.get('/sse', async (req, res) => {
   const apiKey = getApiKey(req);
   if (!apiKey) return res.status(401).json({ error: 'API key required' });
@@ -824,6 +829,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — RUNG 1 TRANSPARENT AUTO-CAPTURE — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — TIME IN EVERY RESPONSE — on port ' + PORT));
 
 export default app;
