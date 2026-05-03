@@ -1,15 +1,5 @@
 /**
- * STCKY MCP SSE Server v4.12.0 — DATE-SHAPED FORWARD SWEEP
- *
- * CHANGELOG v4.12.0:
- * - ADDED: upcoming tool. Wraps GET /api/memory/upcoming?days=N&limit=N.
- *   Returns memories with relevantDate >= NOW, sorted by date ascending,
- *   irrespective of category. This is the date-shaped forward-sweep antibody
- *   for the bucket-shaped wake-up failure documented in
- *   finding/wake-up-packet-forward-sweep-bucket-shaped-not-date-shaped-2026-05-03.
- *   Substrate API endpoint already existed; this exposes it as an MCP tool so
- *   wake-up routines can pull "anything coming up" in one call without category
- *   bucketing. Defaults: days=30, limit=20.
+ * STCKY MCP SSE Server v4.11.0 — RUNG 2: TIME IN EVERY RESPONSE
  *
  * CHANGELOG v4.11.0:
  * - ADDED: NOW prefix ("NOW: Apr 23, 10:05 AM (America/Los_Angeles)\n\n") on
@@ -45,16 +35,15 @@
  * CHANGELOG v4.7.0:
  * - ADDED: memory_delete
  *
- * CORE TOOLS (9):
+ * CORE TOOLS (8):
  * 1. get_now — DEPRECATED as of v4.11.0 (time now in every response); kept for back-compat
  * 2. associative_recall — semantic + temporal retrieval (PRIMARY, time-aware)
- * 3. upcoming — date-shaped forward sweep, anything with relevantDate >= NOW
- * 4. memory_store — save curated memories (time-aware response)
- * 5. memory_delete — remove memories by category + key (time-aware response)
- * 6. enrich — entity extraction + cluster activation (time-aware response)
- * 7. project_get — project context (time-aware response)
- * 8. set_timezone — update user's timezone (time-aware response)
- * 9. ingest — content-addressed raw capture, autonomic at MCP layer (time-aware response)
+ * 3. memory_store — save curated memories (time-aware response)
+ * 4. memory_delete — remove memories by category + key (time-aware response)
+ * 5. enrich — entity extraction + cluster activation (time-aware response)
+ * 6. project_get — project context (time-aware response)
+ * 7. set_timezone — update user's timezone (time-aware response)
+ * 8. ingest — content-addressed raw capture, autonomic at MCP layer (time-aware response)
  */
 import express from 'express';
 import crypto from 'crypto';
@@ -70,7 +59,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.12.0';
+const VERSION = '4.11.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -326,7 +315,6 @@ async function triggerAutoStore(apiKey, toolName, toolInput, toolResult) {
 function degradedResponse(toolName, error) {
   const messages = {
     associative_recall: '⚠️ Memory service temporarily unavailable. Error: ' + error,
-    upcoming: '⚠️ Upcoming-items lookup unavailable. Error: ' + error,
     memory_store: '⚠️ Unable to save to memory. Error: ' + error,
     memory_delete: '⚠️ Unable to delete memory. Error: ' + error,
     enrich: '⚠️ Context enrichment unavailable.',
@@ -401,18 +389,6 @@ const TOOLS = [
         limit: { type: 'number', description: 'Max results' }
       },
       required: ['query']
-    }
-  },
-  {
-    name: 'upcoming',
-    description: 'DATE-SHAPED FORWARD SWEEP. Returns memories with relevantDate from NOW forward, sorted by date ascending, regardless of category — appointments, deadlines, hearings, calls, scheduled events, anything with a future date. Use at session start to get the forward landscape without semantic-query bucketing. Pairs with associative_recall for wake-up: associative_recall surfaces what is on your mind right now, upcoming surfaces what is on the calendar. Defaults: days=30, limit=20.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        days: { type: 'number', description: 'How many days forward to sweep (default 30)' },
-        limit: { type: 'number', description: 'Max items to return (default 20)' }
-      },
-      required: []
     }
   },
   {
@@ -611,40 +587,6 @@ async function handleTool(apiKey, name, args) {
         break;
       }
 
-      case 'upcoming': {
-        // v4.12.0: date-shaped forward sweep. Returns memories with relevantDate
-        // from NOW forward, sorted ascending, regardless of category.
-        const days = (args && typeof args.days === 'number') ? args.days : 30;
-        const limit = (args && typeof args.limit === 'number') ? args.limit : 20;
-        const endpoint = '/api/memory/upcoming?days=' + encodeURIComponent(days) + '&limit=' + encodeURIComponent(limit);
-
-        result = await apiCall(apiKey, 'GET', endpoint);
-
-        const memories = result.memories || [];
-        const window = result.window || null;
-
-        if (memories.length === 0) {
-          const windowNote = window
-            ? ` (window ${new Date(window.from).toLocaleDateString()} → ${new Date(window.to).toLocaleDateString()})`
-            : '';
-          resultText = `No upcoming items in the next ${days} days${windowNote}.`;
-        } else {
-          let output = `${memories.length} upcoming item${memories.length === 1 ? '' : 's'} in the next ${days} days, sorted by date:\n\n`;
-          memories.forEach((m, i) => {
-            const due = m.relevantDate ? new Date(m.relevantDate).toLocaleDateString() : '(no date)';
-            const domain = m.domain ? ' [' + m.domain + ']' : '';
-            const anchor = m.anchor ? ' ⚓' : '';
-            output += `${i + 1}. [${m.category}] ${m.key} — due ${due}${domain}${anchor}\n`;
-            const valueSnippet = (m.value || '').slice(0, 300);
-            output += `   ${valueSnippet}${m.value && m.value.length > 300 ? '...' : ''}\n\n`;
-          });
-          resultText = output;
-        }
-
-        triggerAutoStore(apiKey, name, `days=${days} limit=${limit}`, resultText);
-        break;
-      }
-
       case 'memory_store': {
         const { category, key, value, tags, source, relevantDate, domain, anchor } = args;
         const body = { category, key, value };
@@ -824,7 +766,7 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'DATE-SHAPED FORWARD SWEEP',
+    brain: 'TIME IN EVERY RESPONSE',
     now: now.short,
     timezone: now.timezone,
     apiHealthy,
@@ -887,6 +829,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — DATE-SHAPED FORWARD SWEEP — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — TIME IN EVERY RESPONSE — on port ' + PORT));
 
 export default app;
