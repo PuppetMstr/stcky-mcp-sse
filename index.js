@@ -1,5 +1,18 @@
 /**
- * STCKY MCP SSE Server v4.12.0 — DATE-SHAPED FORWARD SWEEP
+ * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
+ *
+ * CHANGELOG v4.13.0:
+ * - ADDED: organism_wake_up tool. Mechanical structured wake-up packet that
+ *   replaces the multi-tool discipline-dependent session-start sequence
+ *   (associative_recall + upcoming + manual structuring) with a single call
+ *   that returns current_state, forward_landscape, deferred_asks, and
+ *   substrate_health in one structured response.
+ *   Internally fans out 4 parallel substrate queries via Promise.allSettled
+ *   so partial failures don't kill the whole packet.
+ *   Detects current_state staleness (>24h) and surfaces it as a warning,
+ *   addressing finding/no-session-end-enforcement-may-2-gap-2026-05-03.
+ *   Implements Organism Beta Phase 2 per architect-response/eli-organism-beta
+ *   -architecture-spec-2026-05-01.
  *
  * CHANGELOG v4.12.0:
  * - ADDED: upcoming tool. Wraps GET /api/memory/upcoming?days=N&limit=N.
@@ -7,54 +20,38 @@
  *   irrespective of category. This is the date-shaped forward-sweep antibody
  *   for the bucket-shaped wake-up failure documented in
  *   finding/wake-up-packet-forward-sweep-bucket-shaped-not-date-shaped-2026-05-03.
- *   Substrate API endpoint already existed; this exposes it as an MCP tool so
- *   wake-up routines can pull "anything coming up" in one call without category
- *   bucketing. Defaults: days=30, limit=20.
  *
  * CHANGELOG v4.11.0:
- * - ADDED: NOW prefix ("NOW: Apr 23, 10:05 AM (America/Los_Angeles)\n\n") on
- *   EVERY tool response except get_now (which already carries full time).
- *   Model no longer needs a standalone time call — time comes free with any
- *   recall, store, ingest, or other tool activity.
- * - DEPRECATED: get_now tool description updated to note that time is now
- *   included in every tool response; get_now kept for backward compatibility
- *   with existing protocols but no longer the primary way to know the time.
+ * - ADDED: NOW prefix on EVERY tool response except get_now.
+ * - DEPRECATED: get_now tool description updated.
  * - This is Rung 2 of Chaos's blob-substrate transition ladder.
  * - REFACTORED: NOW prefix construction unified in handleTool wrapper.
- *   associative_recall no longer builds its own NOW line (dedup).
  *
  * CHANGELOG v4.10.0:
- * - ADDED: transparent auto-capture of all tool calls at the MCP layer. Every
- *   tool invocation fires a start event + completion event (or failure event)
- *   to /api/ingest, linked by call_id, fire-and-forget.
- * - ADDED: session_id per MCP connection, X-Agent-Identity header support,
- *   event fingerprint.
+ * - ADDED: transparent auto-capture of all tool calls at the MCP layer.
+ * - ADDED: session_id per MCP connection, X-Agent-Identity header support.
  *
  * CHANGELOG v4.9.1:
  * - FIX: associative_recall now surfaces objects collection alongside memories.
  *
  * CHANGELOG v4.9.0:
- * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP
- *   connection.
+ * - SECURITY: Validate API key against api.stcky.ai/api/me before opening SSE/MCP connection.
  * - ADDED: ingest tool.
- * - CHANGED: Default API_URL fallback is now https://api.stcky.ai.
  *
- * CHANGELOG v4.8.0:
- * - ADDED: get_now, set_timezone
+ * CHANGELOG v4.8.0: ADDED: get_now, set_timezone
+ * CHANGELOG v4.7.0: ADDED: memory_delete
  *
- * CHANGELOG v4.7.0:
- * - ADDED: memory_delete
- *
- * CORE TOOLS (9):
- * 1. get_now — DEPRECATED as of v4.11.0 (time now in every response); kept for back-compat
- * 2. associative_recall — semantic + temporal retrieval (PRIMARY, time-aware)
- * 3. upcoming — date-shaped forward sweep, anything with relevantDate >= NOW
- * 4. memory_store — save curated memories (time-aware response)
- * 5. memory_delete — remove memories by category + key (time-aware response)
- * 6. enrich — entity extraction + cluster activation (time-aware response)
- * 7. project_get — project context (time-aware response)
- * 8. set_timezone — update user's timezone (time-aware response)
- * 9. ingest — content-addressed raw capture, autonomic at MCP layer (time-aware response)
+ * CORE TOOLS (10):
+ * 1. get_now — DEPRECATED; time now in every response
+ * 2. associative_recall — semantic + temporal retrieval
+ * 3. upcoming — date-shaped forward sweep
+ * 4. organism_wake_up — mechanical structured wake-up packet (Phase 2)
+ * 5. memory_store — save curated memories
+ * 6. memory_delete — remove memories by category + key
+ * 7. enrich — entity extraction + cluster activation
+ * 8. project_get — project context
+ * 9. set_timezone — update user's timezone
+ * 10. ingest — content-addressed raw capture
  */
 import express from 'express';
 import crypto from 'crypto';
@@ -70,7 +67,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.12.0';
+const VERSION = '4.13.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -205,12 +202,6 @@ function getNow(timezone = DEFAULT_TIMEZONE) {
   }
 }
 
-/**
- * Build the NOW prefix string for a tool response. v4.11.0 Rung 2: every
- * non-get_now tool response carries this at the top so the model never needs
- * to call get_now separately. Uses cached timezone if available, falls back
- * to an async fetch, ultimately UTC.
- */
 async function buildNowPrefix(apiKey) {
   const timezone = await getUserTimezone(apiKey);
   const now = getNow(timezone);
@@ -327,6 +318,7 @@ function degradedResponse(toolName, error) {
   const messages = {
     associative_recall: '⚠️ Memory service temporarily unavailable. Error: ' + error,
     upcoming: '⚠️ Upcoming-items lookup unavailable. Error: ' + error,
+    organism_wake_up: '⚠️ Wake-up packet unavailable. Error: ' + error,
     memory_store: '⚠️ Unable to save to memory. Error: ' + error,
     memory_delete: '⚠️ Unable to delete memory. Error: ' + error,
     enrich: '⚠️ Context enrichment unavailable.',
@@ -411,6 +403,17 @@ const TOOLS = [
       properties: {
         days: { type: 'number', description: 'How many days forward to sweep (default 30)' },
         limit: { type: 'number', description: 'Max items to return (default 20)' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'organism_wake_up',
+    description: 'ORGANISM BETA PHASE 2: mechanical structured wake-up packet. Single call returns current_state + forward_landscape + deferred_asks + substrate_health, replacing the multi-tool discipline-dependent session-start sequence. Surfaces stale current_state warnings (>24h old). Use at session start instead of calling associative_recall + upcoming separately. Defaults: days=30 for the forward landscape.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: 'How many days forward to sweep for the forward_landscape (default 30)' }
       },
       required: []
     }
@@ -569,7 +572,6 @@ async function handleTool(apiKey, name, args) {
 
         result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
 
-        // v4.11.0: NOW prefix is added by the wrapper below — no longer built here.
         let output = '';
 
         const hasMemories = result.memories && result.memories.length > 0;
@@ -612,8 +614,6 @@ async function handleTool(apiKey, name, args) {
       }
 
       case 'upcoming': {
-        // v4.12.0: date-shaped forward sweep. Returns memories with relevantDate
-        // from NOW forward, sorted ascending, regardless of category.
         const days = (args && typeof args.days === 'number') ? args.days : 30;
         const limit = (args && typeof args.limit === 'number') ? args.limit : 20;
         const endpoint = '/api/memory/upcoming?days=' + encodeURIComponent(days) + '&limit=' + encodeURIComponent(limit);
@@ -642,6 +642,193 @@ async function handleTool(apiKey, name, args) {
         }
 
         triggerAutoStore(apiKey, name, `days=${days} limit=${limit}`, resultText);
+        break;
+      }
+
+      case 'organism_wake_up': {
+        // v4.13.0: Organism Beta Phase 2 — mechanical structured wake-up packet.
+        // Fans out four parallel substrate queries and assembles the packet.
+        // Promise.allSettled so partial failures don't kill the whole packet —
+        // wake-up should ALWAYS deliver something useful at session start.
+        const days = (args && typeof args.days === 'number') ? args.days : 30;
+        const STALENESS_THRESHOLD_HOURS = 24;
+        const nowMs = Date.now();
+
+        const [nowStateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
+          apiCall(apiKey, 'POST', '/api/associative', {
+            query: 'now state canonical session current end of session',
+            limit: 5
+          }),
+          apiCall(apiKey, 'POST', '/api/associative', {
+            query: 'deferred ask unfulfilled pending overdue',
+            limit: 10
+          }),
+          apiCall(apiKey, 'GET', '/api/memory?category=substrate-health&key=heartbeat-current'),
+          apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`)
+        ]);
+
+        // CURRENT STATE — most recent now/state
+        let currentState = null;
+        if (nowStateResult.status === 'fulfilled' && nowStateResult.value.memories) {
+          const nowStates = nowStateResult.value.memories.filter(m => m.category === 'now');
+          if (nowStates.length > 0) {
+            nowStates.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+            const ns = nowStates[0];
+            const ageMs = nowMs - new Date(ns.updatedAt).getTime();
+            const ageHours = Math.floor(ageMs / (1000 * 60 * 60));
+            currentState = {
+              key: ns.key,
+              ts: new Date(ns.updatedAt).toISOString(),
+              age_hours: ageHours,
+              is_stale: ageHours >= STALENESS_THRESHOLD_HOURS,
+              excerpt: (ns.value || '').slice(0, 500)
+            };
+          }
+        }
+
+        // DEFERRED ASKS
+        let deferredAsks = [];
+        if (deferredAsksResult.status === 'fulfilled' && deferredAsksResult.value.memories) {
+          deferredAsks = deferredAsksResult.value.memories
+            .filter(m => m.category === 'deferred-ask')
+            .map(m => {
+              const ageDays = m.updatedAt
+                ? Math.floor((nowMs - new Date(m.updatedAt).getTime()) / (1000 * 60 * 60 * 24))
+                : null;
+              const dueDate = m.relevantDate
+                ? new Date(m.relevantDate).toLocaleDateString()
+                : null;
+              return {
+                key: m.key,
+                summary: (m.value || '').slice(0, 200),
+                age_days: ageDays,
+                due_date: dueDate
+              };
+            });
+        }
+
+        // SUBSTRATE HEALTH
+        let substrateHealth = null;
+        let heartbeatAgeMin = null;
+        if (healthResult.status === 'fulfilled' && healthResult.value.memories && healthResult.value.memories.length > 0) {
+          const heartbeatMem = healthResult.value.memories[0];
+          try {
+            substrateHealth = JSON.parse(heartbeatMem.value);
+          } catch (e) {
+            substrateHealth = {
+              parse_error: e.message,
+              raw_excerpt: (heartbeatMem.value || '').slice(0, 200)
+            };
+          }
+          if (heartbeatMem.updatedAt) {
+            heartbeatAgeMin = Math.floor((nowMs - new Date(heartbeatMem.updatedAt).getTime()) / (1000 * 60));
+          }
+        }
+
+        // FORWARD LANDSCAPE
+        let forwardLandscape = [];
+        if (upcomingResult.status === 'fulfilled' && upcomingResult.value.memories) {
+          forwardLandscape = upcomingResult.value.memories.map(m => ({
+            key: m.key,
+            category: m.category,
+            due: m.relevantDate ? new Date(m.relevantDate).toLocaleDateString() : null,
+            domain: m.domain || null,
+            summary: (m.value || '').slice(0, 200)
+          }));
+        }
+
+        // BUILD STRUCTURED OUTPUT
+        let output = '═══ ORGANISM WAKE-UP PACKET ═══\n\n';
+
+        // Current State
+        output += '── CURRENT STATE ──\n';
+        if (currentState) {
+          const staleMarker = currentState.is_stale ? ` ⚠️ STALE (>${STALENESS_THRESHOLD_HOURS}h)` : '';
+          output += `Anchor: ${currentState.key}\n`;
+          output += `Age: ${currentState.age_hours}h${staleMarker}\n`;
+          output += `Excerpt:\n${currentState.excerpt}${currentState.excerpt.length >= 500 ? '...' : ''}\n\n`;
+          if (currentState.is_stale) {
+            output += `⚠️ Anchor is older than ${STALENESS_THRESHOLD_HOURS}h. The substrate has not been refreshed at recent session-end. Yesterday-Eli likely did not file an end-of-session now/state. Treat the anchor as a starting point but verify against recent activity (associative_recall on recent topics) to fill in what happened since the anchor was filed.\n\n`;
+          }
+        } else {
+          output += '⚠️ No now/state found. Substrate has no current anchor. Consider filing one to start the session.\n\n';
+        }
+
+        // Forward Landscape
+        output += `── FORWARD LANDSCAPE (next ${days} days) ──\n`;
+        if (forwardLandscape.length === 0) {
+          output += `No items dated forward. Calendar surface is clear.\n\n`;
+        } else {
+          forwardLandscape.forEach((item, i) => {
+            const dom = item.domain ? ` [${item.domain}]` : '';
+            output += `${i + 1}. [${item.category}] ${item.key} — due ${item.due}${dom}\n`;
+            output += `   ${item.summary}${item.summary.length >= 200 ? '...' : ''}\n`;
+          });
+          output += '\n';
+        }
+
+        // Deferred Asks
+        output += '── DEFERRED ASKS ──\n';
+        if (deferredAsks.length === 0) {
+          output += 'No deferred asks pending.\n\n';
+        } else {
+          deferredAsks.forEach((ask, i) => {
+            const ageNote = ask.age_days != null ? ` (${ask.age_days}d old)` : '';
+            const dueNote = ask.due_date ? ` [due ${ask.due_date}]` : '';
+            output += `${i + 1}. ${ask.key}${ageNote}${dueNote}\n`;
+            output += `   ${ask.summary}${ask.summary.length >= 200 ? '...' : ''}\n`;
+          });
+          output += '\n';
+        }
+
+        // Substrate Health
+        output += '── SUBSTRATE HEALTH ──\n';
+        if (substrateHealth) {
+          if (substrateHealth.parse_error) {
+            output += `⚠️ Heartbeat memory exists but did not parse: ${substrateHealth.parse_error}\n\n`;
+          } else {
+            const overallStatus = substrateHealth.overall_status || 'unknown';
+            const heartbeatAgeNote = heartbeatAgeMin != null ? ` (heartbeat ${heartbeatAgeMin}min ago)` : '';
+            output += `Overall: ${overallStatus}${heartbeatAgeNote}\n`;
+            const svc = substrateHealth.services || {};
+            if (svc.api) output += `  API: ${svc.api.status} (${svc.api.version || '?'})\n`;
+            if (svc.database) output += `  Database: ${svc.database.status}\n`;
+            if (svc.capture) {
+              const ageMin = svc.capture.age_minutes;
+              output += `  Capture: ${svc.capture.status}${ageMin != null ? ` (${ageMin}min since last event)` : ''}\n`;
+            }
+            if (svc.recall) {
+              const ageMin = svc.recall.age_minutes;
+              output += `  Recall: ${svc.recall.status}${ageMin != null ? ` (${ageMin}min since last write)` : ''}\n`;
+            }
+            if (svc.correction_resolver) {
+              output += `  Correction resolver: ${svc.correction_resolver.status} (mode: ${svc.correction_resolver.mode})\n`;
+            }
+            if (substrateHealth.organism) {
+              output += `  Organism phase 1: ${substrateHealth.organism.phase_1_status}, latest now/state: ${substrateHealth.organism.latest_now_state_key || '(none)'}\n`;
+            }
+            output += '\n';
+          }
+        } else {
+          output += '⚠️ No heartbeat memory found. Substrate health is unknown. ' +
+                    'Either the cron has not run yet or the heartbeat memory was deleted.\n\n';
+        }
+
+        output += `── PACKET GENERATED AT ${new Date().toISOString()} ──`;
+
+        // Surface partial failures at the bottom so they don't get missed
+        const errors = [];
+        if (nowStateResult.status === 'rejected') errors.push('now_state query failed: ' + nowStateResult.reason.message);
+        if (deferredAsksResult.status === 'rejected') errors.push('deferred_asks query failed: ' + deferredAsksResult.reason.message);
+        if (healthResult.status === 'rejected') errors.push('health query failed: ' + healthResult.reason.message);
+        if (upcomingResult.status === 'rejected') errors.push('upcoming query failed: ' + upcomingResult.reason.message);
+        if (errors.length > 0) {
+          output += '\n\n⚠️ PARTIAL FAILURES (some packet sections may be incomplete):\n' +
+                    errors.map(e => '  - ' + e).join('\n');
+        }
+
+        resultText = output;
+        triggerAutoStore(apiKey, name, `organism_wake_up days=${days}`, resultText);
         break;
       }
 
@@ -738,13 +925,11 @@ async function handleTool(apiKey, name, args) {
     }
 
     // v4.11.0 Rung 2: prepend NOW to every response except get_now
-    // (which already carries full time info in its own response).
     if (name !== 'get_now') {
       try {
         const nowPrefix = await buildNowPrefix(apiKey);
         resultText = nowPrefix + resultText;
       } catch (tzError) {
-        // If timezone resolution fails, ship response without prefix rather than fail the tool.
         console.error('[NOW-PREFIX] failed to build prefix:', tzError.message);
       }
     }
@@ -786,7 +971,6 @@ async function handleTool(apiKey, name, args) {
       });
     }
 
-    // v4.11.0: prepend NOW to error response too (except for get_now).
     const degraded = degradedResponse(name, error.message);
     if (name !== 'get_now' && degraded.content?.[0]?.text) {
       try {
@@ -824,7 +1008,7 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'DATE-SHAPED FORWARD SWEEP',
+    brain: 'ORGANISM WAKE-UP PACKET',
     now: now.short,
     timezone: now.timezone,
     apiHealthy,
@@ -887,6 +1071,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — DATE-SHAPED FORWARD SWEEP — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — ORGANISM WAKE-UP PACKET — on port ' + PORT));
 
 export default app;
