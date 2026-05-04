@@ -67,7 +67,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.14.0';
+const VERSION = '4.14.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -697,6 +697,33 @@ async function handleTool(apiKey, name, args) {
           }
         }
 
+        // v4.14.1: enrich each handle by fetching bundle/<handle> in parallel
+        if (activeEpisodes.length > 0) {
+          const bundleResults = await Promise.allSettled(
+            activeEpisodes.map(ep =>
+              apiCall(apiKey, 'GET', `/api/memory?category=bundle&key=${encodeURIComponent(ep.handle.slice(1))}`)
+            )
+          );
+          bundleResults.forEach((result, i) => {
+            if (result.status === 'fulfilled' && result.value && result.value.memories && result.value.memories.length > 0) {
+              const bundle = result.value.memories[0];
+              const bv = bundle.value || '';
+              const oneLineMatch = bv.match(/ONE-LINE:\s*(.+)/);
+              const statusMatch = bv.match(/STATUS:\s*(.+)/);
+              const membersSection = bv.match(/═══ MEMBERS ═══([\s\S]*?)(?:═══|$)/);
+              let memberCount = 0;
+              if (membersSection) {
+                memberCount = (membersSection[1].match(/^- /gm) || []).length;
+              }
+              activeEpisodes[i].bundle = {
+                one_line: oneLineMatch ? oneLineMatch[1].trim() : null,
+                status: statusMatch ? statusMatch[1].trim() : null,
+                member_count: memberCount,
+              };
+            }
+          });
+        }
+
         // DEFERRED ASKS
         let deferredAsks = [];
         if (deferredAsksResult.status === 'fulfilled' && deferredAsksResult.value.memories) {
@@ -778,13 +805,22 @@ async function handleTool(apiKey, name, args) {
           output += '\n';
         }
 
-        // Active Episodes (v4.14.0)
+        // Active Episodes (v4.14.1: enriched with bundle metadata when bundle/<handle> exists)
         output += '── ACTIVE EPISODES ──\n';
         if (activeEpisodes.length === 0) {
           output += 'No @handles found in recent now/state. Episode handles emerge from manual now/state filings.\n\n';
         } else {
           activeEpisodes.forEach((ep, i) => {
-            output += (i + 1) + '. ' + ep.handle + ' (' + ep.mention_count + ' mention' + (ep.mention_count === 1 ? '' : 's') + ')\n';
+            output += (i + 1) + '. ' + ep.handle;
+            if (ep.bundle) {
+              const memNoun = ep.bundle.member_count === 1 ? 'member' : 'members';
+              output += ' [' + ep.bundle.status + ', ' + ep.bundle.member_count + ' ' + memNoun + ']\n';
+              if (ep.bundle.one_line) {
+                output += '   ' + ep.bundle.one_line + '\n';
+              }
+            } else {
+              output += ' (' + ep.mention_count + ' mention' + (ep.mention_count === 1 ? '' : 's') + ', no bundle filed)\n';
+            }
           });
           output += '\n';
         }
