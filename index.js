@@ -67,7 +67,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.13.1';
+const VERSION = '4.14.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -669,6 +669,7 @@ async function handleTool(apiKey, name, args) {
 
         // CURRENT STATE — most recent now/state
         let currentState = null;
+        let activeEpisodes = [];
         if (nowStateResult.status === 'fulfilled' && nowStateResult.value.memories) {
           const nowStates = nowStateResult.value.memories.filter(m => m.category === 'now');
           if (nowStates.length > 0) {
@@ -683,6 +684,16 @@ async function handleTool(apiKey, name, args) {
               is_stale: ageHours >= STALENESS_THRESHOLD_HOURS,
               excerpt: (ns.value || '').slice(0, 500)
             };
+            // v4.14.0: extract @handles from now/state for active episodes slice
+            const handleMatches = (ns.value || '').match(/@[a-z][a-z0-9-]*/gi) || [];
+            const handleCounts = {};
+            for (const h of handleMatches) {
+              const lower = h.toLowerCase();
+              handleCounts[lower] = (handleCounts[lower] || 0) + 1;
+            }
+            activeEpisodes = Object.entries(handleCounts)
+              .map(([handle, count]) => ({ handle, mention_count: count }))
+              .sort((a, b) => b.mention_count - a.mention_count);
           }
         }
 
@@ -763,6 +774,17 @@ async function handleTool(apiKey, name, args) {
             const dom = item.domain ? ` [${item.domain}]` : '';
             output += `${i + 1}. [${item.category}] ${item.key} — due ${item.due}${dom}\n`;
             output += `   ${item.summary}${item.summary.length >= 200 ? '...' : ''}\n`;
+          });
+          output += '\n';
+        }
+
+        // Active Episodes (v4.14.0)
+        output += '── ACTIVE EPISODES ──\n';
+        if (activeEpisodes.length === 0) {
+          output += 'No @handles found in recent now/state. Episode handles emerge from manual now/state filings.\n\n';
+        } else {
+          activeEpisodes.forEach((ep, i) => {
+            output += (i + 1) + '. ' + ep.handle + ' (' + ep.mention_count + ' mention' + (ep.mention_count === 1 ? '' : 's') + ')\n';
           });
           output += '\n';
         }

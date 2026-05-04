@@ -7,3 +7,5 @@ node_modules/
 *.bak
 *.bak-*
 index.js.v*
+patch-v*.cjs
+*.bak-pre-*
