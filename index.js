@@ -67,7 +67,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.14.1';
+const VERSION = '4.15.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -685,7 +685,7 @@ async function handleTool(apiKey, name, args) {
               excerpt: (ns.value || '').slice(0, 500)
             };
             // v4.14.0: extract @handles from now/state for active episodes slice
-            const handleMatches = (ns.value || '').match(/@[a-z][a-z0-9-]*/gi) || [];
+            const handleMatches = (ns.value || '').match(/@[a-z][a-z0-9]*-[a-z0-9-]*[a-z0-9]/gi) || [];
             const handleCounts = {};
             for (const h of handleMatches) {
               const lower = h.toLowerCase();
@@ -697,7 +697,55 @@ async function handleTool(apiKey, name, args) {
           }
         }
 
-        // v4.14.1: enrich each handle by fetching bundle/<handle> in parallel
+        // v4.15.0: parseBundle helper + bundle-fetch with strict v1 grammar validation.
+        // Per Chaos's May 4 architect read: parse failures surface as degraded display, not silent.
+        const parseBundle = (value) => {
+          const errors = [];
+          const handleMatch = value.match(/^HANDLE:\s*(@\S+)/m);
+          const oneLineMatch = value.match(/^ONE-LINE:\s*(.+)$/m);
+          const statusMatch = value.match(/^STATUS:\s*(\S+)/m);
+          const startMatch = value.match(/^START:\s*(\d{4}-\d{2}-\d{2})/m);
+          const endMatch = value.match(/^END:\s*(.*)$/m);
+          if (!handleMatch) errors.push('missing HANDLE');
+          if (!oneLineMatch) errors.push('missing ONE-LINE');
+          if (!statusMatch) errors.push('missing STATUS');
+          if (!startMatch) errors.push('missing or malformed START');
+          const validStatuses = ['active', 'paused', 'complete', 'archived'];
+          if (statusMatch && !validStatuses.includes(statusMatch[1])) {
+            errors.push('invalid STATUS: ' + statusMatch[1]);
+          }
+          const membersMatch = value.match(/^MEMBERS:\s*\n((?:- .+\n?)*)/m);
+          const members = [];
+          if (membersMatch) {
+            const memberLines = membersMatch[1].split('\n');
+            for (const line of memberLines) {
+              const m = line.match(/^- (\S+)/);
+              if (m) members.push(m[1]);
+            }
+          }
+          const relsMatch = value.match(/^RELATIONSHIPS:\s*\n((?:- .+\n?)*)/m);
+          const relationships = [];
+          if (relsMatch) {
+            const relLines = relsMatch[1].split('\n');
+            for (const line of relLines) {
+              const m = line.match(/^- (\w+):\s*(@\S+)/);
+              if (m) relationships.push({ type: m[1], handle: m[2] });
+            }
+          }
+          return {
+            valid: errors.length === 0,
+            errors,
+            fields: {
+              handle: handleMatch ? handleMatch[1] : null,
+              one_line: oneLineMatch ? oneLineMatch[1].trim() : null,
+              status: statusMatch ? statusMatch[1] : null,
+              start: startMatch ? startMatch[1] : null,
+              end: endMatch ? (endMatch[1].trim() || null) : null,
+              members,
+              relationships,
+            }
+          };
+        };
         if (activeEpisodes.length > 0) {
           const bundleResults = await Promise.allSettled(
             activeEpisodes.map(ep =>
@@ -707,19 +755,7 @@ async function handleTool(apiKey, name, args) {
           bundleResults.forEach((result, i) => {
             if (result.status === 'fulfilled' && result.value && result.value.memories && result.value.memories.length > 0) {
               const bundle = result.value.memories[0];
-              const bv = bundle.value || '';
-              const oneLineMatch = bv.match(/ONE-LINE:\s*(.+)/);
-              const statusMatch = bv.match(/STATUS:\s*(.+)/);
-              const membersSection = bv.match(/═══ MEMBERS ═══([\s\S]*?)(?:═══|$)/);
-              let memberCount = 0;
-              if (membersSection) {
-                memberCount = (membersSection[1].match(/^- /gm) || []).length;
-              }
-              activeEpisodes[i].bundle = {
-                one_line: oneLineMatch ? oneLineMatch[1].trim() : null,
-                status: statusMatch ? statusMatch[1].trim() : null,
-                member_count: memberCount,
-              };
+              activeEpisodes[i].bundle = parseBundle(bundle.value || '');
             }
           });
         }
@@ -805,7 +841,7 @@ async function handleTool(apiKey, name, args) {
           output += '\n';
         }
 
-        // Active Episodes (v4.14.1: enriched with bundle metadata when bundle/<handle> exists)
+        // Active Episodes (v4.15.0: parseBundle output with .valid/.errors/.fields; degraded display on parse failure)
         output += '── ACTIVE EPISODES ──\n';
         if (activeEpisodes.length === 0) {
           output += 'No @handles found in recent now/state. Episode handles emerge from manual now/state filings.\n\n';
@@ -813,10 +849,15 @@ async function handleTool(apiKey, name, args) {
           activeEpisodes.forEach((ep, i) => {
             output += (i + 1) + '. ' + ep.handle;
             if (ep.bundle) {
-              const memNoun = ep.bundle.member_count === 1 ? 'member' : 'members';
-              output += ' [' + ep.bundle.status + ', ' + ep.bundle.member_count + ' ' + memNoun + ']\n';
-              if (ep.bundle.one_line) {
-                output += '   ' + ep.bundle.one_line + '\n';
+              if (ep.bundle.valid) {
+                const memCount = ep.bundle.fields.members.length;
+                const memNoun = memCount === 1 ? 'member' : 'members';
+                output += ' [' + ep.bundle.fields.status + ', ' + memCount + ' ' + memNoun + ']\n';
+                if (ep.bundle.fields.one_line) {
+                  output += '   ' + ep.bundle.fields.one_line + '\n';
+                }
+              } else {
+                output += ' [bundle found, parse degraded: ' + ep.bundle.errors.join(', ') + ']\n';
               }
             } else {
               output += ' (' + ep.mention_count + ' mention' + (ep.mention_count === 1 ? '' : 's') + ', no bundle filed)\n';
