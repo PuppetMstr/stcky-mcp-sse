@@ -67,7 +67,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.13.0';
+const VERSION = '4.13.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -135,7 +135,7 @@ function initSession(apiKey, agentIdentity) {
   sessionCache.set(apiKey, {
     session_id,
     opened_at: new Date().toISOString(),
-    agent_id: agentIdentity || 'claude-unknown',
+    agent_id: agentIdentity || process.env.STCKY_AGENT_IDENTITY || 'claude-unknown',
   });
   return session_id;
 }
@@ -144,7 +144,7 @@ function getSession(apiKey) {
   return sessionCache.get(apiKey) || {
     session_id: null,
     opened_at: null,
-    agent_id: 'claude-unknown',
+    agent_id: process.env.STCKY_AGENT_IDENTITY || 'claude-unknown',
   };
 }
 
