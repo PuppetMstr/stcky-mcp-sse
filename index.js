@@ -1,6 +1,15 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.17.1:
+ * - TUNE: architect-responses query was generic ("architect response chaos
+ *   eli architecture decision call directive") and biased toward keyword
+ *   match with Apr 27-28 responses, hiding the May 4 Phase 4 response from
+ *   the v4.17.0 slice. Broadened query to include vocabulary from recent
+ *   active-episode work (phase, bundle, rung, organism, mechanism). Limit
+ *   bumped 30 → 100. Same fix shape as v4.16.1's now-state query tune —
+ *   semantic ranker bias closed via wider net + recency-sort.
+ *
  * CHANGELOG v4.17.0:
  * - ADDED: RECENT ARCHITECT-RESPONSES slice in organism_wake_up packet.
  *   Surfaces up to 5 most-recent category=architect-response memories from
@@ -106,7 +115,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.17.0';
+const VERSION = '4.17.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -817,9 +826,11 @@ async function handleTool(apiKey, name, args) {
           }),
           // v4.17.0: surface recent architect-responses so resolution evidence is visible
           // alongside any "pending X" claims that may appear in current_state body.
+          // v4.17.1: broader vocabulary + larger limit so semantic-ranker bias doesn't hide
+          // recent responses (Phase 4, bundles, etc.) behind keyword-aligned older ones.
           apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'architect response chaos eli architecture decision call directive',
-            limit: 30
+            query: 'architect-response chaos eli architecture phase rung bundle organism mechanism design grammar v1 directive decision call review',
+            limit: 100
           })
         ]);
 
