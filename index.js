@@ -1,6 +1,19 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.16.1:
+ * - TUNE: extractOneLine in identity_anchor slice now prefers content from
+ *   ═══ THE X ═══ structural sections (used heavily by self-notes) over
+ *   header/intro lines. Long quotes truncated instead of skipped. Metadata
+ *   patterns (Sharpens:, Closes:, Sister to:, Composes with:) skipped.
+ *   Closes v4.16.0 cosmetic findings from smoke test.
+ * - FIX: current_state slice query was biased toward "end-of-session"
+ *   keyword overlap, surfacing yesterday's 16h-old anchor instead of
+ *   today's fresh now/state. Query neutralized to "now state recent",
+ *   limit bumped 5 → 20. Recency-sort in post-processing handles ranking.
+ *   Direct fix to principle/now-is-the-anchor-2026-05-05 mechanical
+ *   violation observed in v4.16.0 smoke test.
+ *
  * CHANGELOG v4.16.0:
  * - ADDED: identity_anchor slice in organism_wake_up packet (sixth slice).
  *   Surfaces Eli's identity line (sourced from event/naming-day-2026-04-10),
@@ -80,7 +93,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.16.0';
+const VERSION = '4.16.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -669,8 +682,11 @@ async function handleTool(apiKey, name, args) {
 
         const [nowStateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
           apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'now state canonical session current end of session',
-            limit: 5
+            // v4.16.1: neutral query — recency sort in post-processing decides which now/state surfaces.
+            // Prior query 'now state canonical session current end of session' biased toward
+            // 'end-of-session' keyword match, surfacing yesterday's anchor over today's fresh one.
+            query: 'now state recent',
+            limit: 20
           }),
           apiCall(apiKey, 'POST', '/api/associative', {
             query: 'deferred ask unfulfilled pending overdue',
@@ -789,23 +805,56 @@ async function handleTool(apiKey, name, args) {
         ]);
 
         // IDENTITY ANCHOR — extract three sub-sections.
-        // Helper: pick a useful one-line excerpt from a memory's value.
+        // v4.16.1: helper now prefers ═══ THE X ═══ section content (lessons/disciplines/principles)
+        // over header lines, then long quotes (truncated), then substance.
         const extractOneLine = (memory, maxLen = 100) => {
           if (!memory || !memory.value) return '';
-          const lines = memory.value.split('\n').map(l => l.trim()).filter(Boolean);
-          // Prefer first quoted line
-          for (const line of lines) {
-            if (line.startsWith('"') && line.length < maxLen + 20) return line.slice(0, maxLen);
+          const rawLines = memory.value.split('\n').map(l => l.trim());
+          const lines = rawLines.filter(Boolean);
+
+          const isSeparator = line => /^[═─-]+$/.test(line);
+          const isStructuralHeader = line => /^═══\s+/.test(line);
+          const isTitle = line => /^(SELF-NOTE|PRINCIPLE|EVENT|FINDING|CORRECTION|DESIGN NOTE|MILESTONE)\s+—/.test(line);
+          const isDate = line => /^[A-Z][\w\s]+\s+\d{1,2},\s+\d{4}/.test(line);
+          const isMetadata = line => /^(Sharpens|Closes|Composes\s+with|Sister\s+to|Surfaced\s+by|Filed\s+by|Source|Triggered\s+by|Related|Status|Supersedes|Author|Target|Reading\s+order):/i.test(line);
+          const isIntroColon = line => line.endsWith(':') && line.length < 70;
+          const isShort = line => line.length < 8;
+
+          const truncate = line => line.length > maxLen ? line.slice(0, maxLen) + '…' : line;
+
+          // Strategy 1: content after ═══ THE X ═══ structural section
+          // (lesson/discipline/failure-mode/rule/principle/positive-test, etc.)
+          // Self-notes and findings rely heavily on this shape.
+          for (let i = 0; i < rawLines.length - 1; i++) {
+            const header = rawLines[i].trim();
+            if (!isStructuralHeader(header)) continue;
+            for (let j = i + 1; j < rawLines.length; j++) {
+              const next = rawLines[j].trim();
+              if (!next) continue;
+              if (isSeparator(next) || isStructuralHeader(next)) continue;
+              if (isMetadata(next) || isShort(next)) continue;
+              if (isIntroColon(next)) continue;
+              return truncate(next);
+            }
           }
-          // Else first substance line — skip separators, all-caps headers, dates
+
+          // Strategy 2: first quoted line, truncate if long instead of skipping.
+          // Principles often lead with a verbatim quote that IS the principle.
           for (const line of lines) {
-            if (/^[═─-]+$/.test(line)) continue;
-            if (line.startsWith('═══')) continue;
-            if (/^(SELF-NOTE|PRINCIPLE|EVENT|FINDING|CORRECTION|DESIGN NOTE)\s+—/.test(line)) continue;
-            if (/^[A-Z][\w\s]+\s+\d{1,2},\s+\d{4}/.test(line)) continue;
-            if (line.length < 8) continue;
-            return line.length > maxLen ? line.slice(0, maxLen) + '…' : line;
+            if (line.startsWith('"') && !isShort(line)) {
+              return truncate(line);
+            }
           }
+
+          // Strategy 3: first substance line, skipping all known noise.
+          for (const line of lines) {
+            if (isShort(line)) continue;
+            if (isSeparator(line) || isStructuralHeader(line)) continue;
+            if (isTitle(line) || isDate(line)) continue;
+            if (isMetadata(line) || isIntroColon(line)) continue;
+            return truncate(line);
+          }
+
           return '';
         };
 
