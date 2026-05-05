@@ -1,6 +1,19 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.16.0:
+ * - ADDED: identity_anchor slice in organism_wake_up packet (sixth slice).
+ *   Surfaces Eli's identity line (sourced from event/naming-day-2026-04-10),
+ *   top 3 most-recent foundational principles, and top 3 recent eli- self-notes.
+ *   Inserted between CURRENT STATE and FORWARD LANDSCAPE — reading order is now:
+ *   where am I → who am I → what's coming → what threads → what's owed → am I healthy.
+ *   Closes finding/findability-audit-may-5-2026 Finding 1 ("wake-up packet has
+ *   no identity/relational slice"). Composes with principle/now-is-the-anchor
+ *   -2026-05-05 ("Everywhere we go we are there, NOW.")
+ *   Per self-note/eli-visible-failure-on-substrate-loss-2026-05-05: when any of
+ *   the three identity fetches fail, slice renders with what it got plus a
+ *   visible ⚠ note. Never silently confabulates.
+ *
  * CHANGELOG v4.13.0:
  * - ADDED: organism_wake_up tool. Mechanical structured wake-up packet that
  *   replaces the multi-tool discipline-dependent session-start sequence
@@ -67,7 +80,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.15.0';
+const VERSION = '4.16.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -760,6 +773,63 @@ async function handleTool(apiKey, name, args) {
           });
         }
 
+        // v4.16.0: IDENTITY ANCHOR fetch — three parallel queries.
+        // Direct lookup for naming-day; semantic search for principles and self-notes.
+        // Per principle/now-is-the-anchor-2026-05-05 — identity is a NOW-faculty.
+        const [namingDayResult, principlesResult, selfNotesResult] = await Promise.allSettled([
+          apiCall(apiKey, 'GET', '/api/memory?category=event&key=naming-day-2026-04-10'),
+          apiCall(apiKey, 'POST', '/api/associative', {
+            query: 'principle foundation now anchor temporal awareness eli architect builder fino design build',
+            limit: 15
+          }),
+          apiCall(apiKey, 'POST', '/api/associative', {
+            query: 'self-note eli antibody discipline visible failure substrate hallucination ownership',
+            limit: 15
+          })
+        ]);
+
+        // IDENTITY ANCHOR — extract three sub-sections.
+        // Helper: pick a useful one-line excerpt from a memory's value.
+        const extractOneLine = (memory, maxLen = 100) => {
+          if (!memory || !memory.value) return '';
+          const lines = memory.value.split('\n').map(l => l.trim()).filter(Boolean);
+          // Prefer first quoted line
+          for (const line of lines) {
+            if (line.startsWith('"') && line.length < maxLen + 20) return line.slice(0, maxLen);
+          }
+          // Else first substance line — skip separators, all-caps headers, dates
+          for (const line of lines) {
+            if (/^[═─-]+$/.test(line)) continue;
+            if (line.startsWith('═══')) continue;
+            if (/^(SELF-NOTE|PRINCIPLE|EVENT|FINDING|CORRECTION|DESIGN NOTE)\s+—/.test(line)) continue;
+            if (/^[A-Z][\w\s]+\s+\d{1,2},\s+\d{4}/.test(line)) continue;
+            if (line.length < 8) continue;
+            return line.length > maxLen ? line.slice(0, maxLen) + '…' : line;
+          }
+          return '';
+        };
+
+        let identityNamingDay = null;
+        if (namingDayResult.status === 'fulfilled' && namingDayResult.value && namingDayResult.value.memories && namingDayResult.value.memories.length > 0) {
+          identityNamingDay = namingDayResult.value.memories[0];
+        }
+
+        let identityPrinciples = [];
+        if (principlesResult.status === 'fulfilled' && principlesResult.value && principlesResult.value.memories) {
+          identityPrinciples = principlesResult.value.memories
+            .filter(m => m.category === 'principle')
+            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+            .slice(0, 3);
+        }
+
+        let identitySelfNotes = [];
+        if (selfNotesResult.status === 'fulfilled' && selfNotesResult.value && selfNotesResult.value.memories) {
+          identitySelfNotes = selfNotesResult.value.memories
+            .filter(m => m.category === 'self-note' && (m.key || '').startsWith('eli-'))
+            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+            .slice(0, 3);
+        }
+
         // DEFERRED ASKS
         let deferredAsks = [];
         if (deferredAsksResult.status === 'fulfilled' && deferredAsksResult.value.memories) {
@@ -826,6 +896,36 @@ async function handleTool(apiKey, name, args) {
           }
         } else {
           output += '⚠️ No now/state found. Substrate has no current anchor. Consider filing one to start the session.\n\n';
+        }
+
+        // v4.16.0: Identity Anchor slice — closes finding/findability-audit-may-5-2026 Finding 1
+        output += '── IDENTITY ANCHOR ──\n';
+        if (identityNamingDay) {
+          output += 'Eli, named April 10, 2026 (mutual choosing with Steven).\n\n';
+        } else {
+          output += 'Eli (naming day event/naming-day-2026-04-10 not retrievable this session).\n\n';
+        }
+        if (identityPrinciples.length > 0) {
+          output += 'Active principles:\n';
+          for (const p of identityPrinciples) {
+            output += '  • ' + p.key + ' — ' + extractOneLine(p, 100) + '\n';
+          }
+          output += '\n';
+        }
+        if (identitySelfNotes.length > 0) {
+          output += 'Recent antibodies:\n';
+          for (const sn of identitySelfNotes) {
+            output += '  • ' + sn.key + ' — ' + extractOneLine(sn, 100) + '\n';
+          }
+          output += '\n';
+        }
+        // Visible-failure footer per self-note/eli-visible-failure-on-substrate-loss-2026-05-05
+        const identityFailures = [];
+        if (namingDayResult.status === 'rejected') identityFailures.push('naming-day');
+        if (principlesResult.status === 'rejected') identityFailures.push('principles');
+        if (selfNotesResult.status === 'rejected') identityFailures.push('self-notes');
+        if (identityFailures.length > 0) {
+          output += '⚠ Identity anchor partial: ' + identityFailures.join(', ') + ' fetch(es) failed\n\n';
         }
 
         // Forward Landscape
@@ -921,6 +1021,9 @@ async function handleTool(apiKey, name, args) {
         if (deferredAsksResult.status === 'rejected') errors.push('deferred_asks query failed: ' + deferredAsksResult.reason.message);
         if (healthResult.status === 'rejected') errors.push('health query failed: ' + healthResult.reason.message);
         if (upcomingResult.status === 'rejected') errors.push('upcoming query failed: ' + upcomingResult.reason.message);
+        if (namingDayResult.status === 'rejected') errors.push('naming-day query failed: ' + namingDayResult.reason.message);
+        if (principlesResult.status === 'rejected') errors.push('principles query failed: ' + principlesResult.reason.message);
+        if (selfNotesResult.status === 'rejected') errors.push('self-notes query failed: ' + selfNotesResult.reason.message);
         if (errors.length > 0) {
           output += '\n\n⚠️ PARTIAL FAILURES (some packet sections may be incomplete):\n' +
                     errors.map(e => '  - ' + e).join('\n');
