@@ -1,6 +1,19 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.17.0:
+ * - ADDED: RECENT ARCHITECT-RESPONSES slice in organism_wake_up packet.
+ *   Surfaces up to 5 most-recent category=architect-response memories from
+ *   the last 14 days, with key + date + one-line excerpt. Inserted between
+ *   CURRENT STATE and IDENTITY ANCHOR — when Eli reads "pending Chaos read
+ *   since YYYY-MM-DD" in current_state and sees the corresponding architect-
+ *   response key three lines below, the discrepancy is visible without any
+ *   pattern matcher needing to fire.
+ *   Closes finding/findability-audit-may-5-2026 Finding 2 via Shape C
+ *   (surface resolution evidence) instead of pattern-scanning Shape A/B.
+ *   Composes with principle/now-is-the-anchor-2026-05-05 (resolution
+ *   evidence is a NOW-faculty: what's been answered, given where I am).
+ *
  * CHANGELOG v4.16.1:
  * - TUNE: extractOneLine in identity_anchor slice now prefers content from
  *   ═══ THE X ═══ structural sections (used heavily by self-notes) over
@@ -93,7 +106,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.16.1';
+const VERSION = '4.17.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -792,7 +805,7 @@ async function handleTool(apiKey, name, args) {
         // v4.16.0: IDENTITY ANCHOR fetch — three parallel queries.
         // Direct lookup for naming-day; semantic search for principles and self-notes.
         // Per principle/now-is-the-anchor-2026-05-05 — identity is a NOW-faculty.
-        const [namingDayResult, principlesResult, selfNotesResult] = await Promise.allSettled([
+        const [namingDayResult, principlesResult, selfNotesResult, architectResponsesResult] = await Promise.allSettled([
           apiCall(apiKey, 'GET', '/api/memory?category=event&key=naming-day-2026-04-10'),
           apiCall(apiKey, 'POST', '/api/associative', {
             query: 'principle foundation now anchor temporal awareness eli architect builder fino design build',
@@ -801,6 +814,12 @@ async function handleTool(apiKey, name, args) {
           apiCall(apiKey, 'POST', '/api/associative', {
             query: 'self-note eli antibody discipline visible failure substrate hallucination ownership',
             limit: 15
+          }),
+          // v4.17.0: surface recent architect-responses so resolution evidence is visible
+          // alongside any "pending X" claims that may appear in current_state body.
+          apiCall(apiKey, 'POST', '/api/associative', {
+            query: 'architect response chaos eli architecture decision call directive',
+            limit: 30
           })
         ]);
 
@@ -879,6 +898,20 @@ async function handleTool(apiKey, name, args) {
             .slice(0, 3);
         }
 
+        // v4.17.0: extract recent architect-responses (last 14 days, top 5)
+        let recentArchitectResponses = [];
+        if (architectResponsesResult.status === 'fulfilled' && architectResponsesResult.value && architectResponsesResult.value.memories) {
+          const fourteenDaysAgo = nowMs - (14 * 24 * 60 * 60 * 1000);
+          recentArchitectResponses = architectResponsesResult.value.memories
+            .filter(m => m.category === 'architect-response')
+            .filter(m => {
+              const ts = new Date(m.updatedAt || m.createdAt || 0).getTime();
+              return ts >= fourteenDaysAgo;
+            })
+            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+            .slice(0, 5);
+        }
+
         // DEFERRED ASKS
         let deferredAsks = [];
         if (deferredAsksResult.status === 'fulfilled' && deferredAsksResult.value.memories) {
@@ -945,6 +978,22 @@ async function handleTool(apiKey, name, args) {
           }
         } else {
           output += '⚠️ No now/state found. Substrate has no current anchor. Consider filing one to start the session.\n\n';
+        }
+
+        // v4.17.0: Recent Architect-Responses slice — closes finding/findability-audit-may-5-2026 Finding 2
+        // Surfaces resolution evidence so "pending X" claims in current_state can be cross-checked.
+        output += '── RECENT ARCHITECT-RESPONSES (LAST 14 DAYS) ──\n';
+        if (recentArchitectResponses.length === 0) {
+          output += 'No architect-responses in the last 14 days.\n\n';
+        } else {
+          for (const ar of recentArchitectResponses) {
+            const ts = ar.updatedAt || ar.createdAt;
+            const date = ts ? new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '?';
+            output += '  • ' + ar.key + ' (' + date + ')\n';
+            const excerpt = extractOneLine(ar, 100);
+            if (excerpt) output += '    ' + excerpt + '\n';
+          }
+          output += '\n';
         }
 
         // v4.16.0: Identity Anchor slice — closes finding/findability-audit-may-5-2026 Finding 1
@@ -1073,6 +1122,7 @@ async function handleTool(apiKey, name, args) {
         if (namingDayResult.status === 'rejected') errors.push('naming-day query failed: ' + namingDayResult.reason.message);
         if (principlesResult.status === 'rejected') errors.push('principles query failed: ' + principlesResult.reason.message);
         if (selfNotesResult.status === 'rejected') errors.push('self-notes query failed: ' + selfNotesResult.reason.message);
+        if (architectResponsesResult.status === 'rejected') errors.push('architect-responses query failed: ' + architectResponsesResult.reason.message);
         if (errors.length > 0) {
           output += '\n\n⚠️ PARTIAL FAILURES (some packet sections may be incomplete):\n' +
                     errors.map(e => '  - ' + e).join('\n');
