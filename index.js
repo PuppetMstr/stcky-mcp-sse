@@ -1,6 +1,20 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.19.0:
+ * - REPLACED: deferred-asks slice fetch swapped from /api/associative
+ *   semantic query to /api/memory/list?category=deferred-ask structural
+ *   lookup. Same paradigm correction as v4.18.0 (now-state slice), now
+ *   applied at the deferred-asks site. Confirms and closes the fourth
+ *   instance of the slice-paradigm-mismatch pattern flagged in
+ *   milestone/mcp-sse-v4-17-recent-architect-responses-slice-shipped
+ *   -2026-05-05 and finding/slice-paradigm-misformed-for-structural
+ *   -questions-2026-05-06.
+ *   Smoke-test trigger: v4.18.0 wake-up showed "No deferred asks pending"
+ *   despite ≥2 open deferred-ask memories in substrate. Cleo-api's
+ *   existing /memory/list action handles category-filtered list natively;
+ *   no cleo-api change required.
+ *
  * CHANGELOG v4.18.0:
  * - REPLACED: CURRENT STATE slice → RECENT SUBSTRATE slice in organism_wake_up.
  *   The slice paradigm asked a structural question ("most recent now/state")
@@ -132,7 +146,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.18.0';
+const VERSION = '4.19.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -726,10 +740,9 @@ async function handleTool(apiKey, name, args) {
         const RECENT_CATEGORIES = 'now,vision,principle,finding,design-note,self-note,decision,milestone,correction';
         const [recentSubstrateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
           apiCall(apiKey, 'GET', `/api/memory/recent?hours=${RECENT_HOURS}&categories=${encodeURIComponent(RECENT_CATEGORIES)}&limit=50`),
-          apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'deferred ask unfulfilled pending overdue',
-            limit: 10
-          }),
+          // v4.19.0: structural lookup replaces semantic query for deferred-asks.
+          // Same paradigm correction as v4.18.0 at the now-state slice.
+          apiCall(apiKey, 'GET', '/api/memory/list?category=deferred-ask&limit=20'),
           apiCall(apiKey, 'GET', '/api/memory?category=substrate-health&key=heartbeat-current'),
           apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`)
         ]);
