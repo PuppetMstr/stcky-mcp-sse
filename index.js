@@ -1,6 +1,21 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.20.0:
+ * - ADDED: RECENT RAW slice in organism_wake_up packet. Surfaces the raw
+ *   substrate layer (conversation turns, tool events, file uploads) NOW-
+ *   anchored at the wake-up surface. Mirrors the v4.18.0 RECENT SUBSTRATE
+ *   slice but reads from cleo.objects instead of cleo.memories.
+ *   Calls new cleo-api endpoint: GET /api/objects/recent
+ *   (shipped v4.19.2 cleo-api 2026-05-06 — userId is ObjectId, ingested_at
+ *   is Date, speaker is top-level; verified via BSON $type).
+ *   Defaults: windowHours=1, limit=10. Per principle/slices-anchor-on-now-
+ *   llm-expands-2026-05-06: small NOW-anchored sample, the LLM expands via
+ *   associative_recall when more context is needed.
+ *   Implements design-note/recent-raw-slice-v0-2026-05-06. Closes the
+ *   Claude-side parity build before Chaos handoff for the ChatGPT-side
+ *   mirror per Steven's two-target call.
+ *
  * CHANGELOG v4.19.0:
  * - REPLACED: deferred-asks slice fetch swapped from /api/associative
  *   semantic query to /api/memory/list?category=deferred-ask structural
@@ -146,7 +161,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.19.0';
+const VERSION = '4.20.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -738,13 +753,19 @@ async function handleTool(apiKey, name, args) {
         // Per vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
         const RECENT_HOURS = 36;
         const RECENT_CATEGORIES = 'now,vision,principle,finding,design-note,self-note,decision,milestone,correction';
-        const [recentSubstrateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
+        // v4.20.0: RECENT RAW slice — small NOW-anchored sample of raw substrate.
+        // Per principle/slices-anchor-on-now-llm-expands-2026-05-06.
+        const RAW_WINDOW_HOURS = 1;
+        const RAW_LIMIT = 10;
+        const [recentSubstrateResult, deferredAsksResult, healthResult, upcomingResult, recentRawResult] = await Promise.allSettled([
           apiCall(apiKey, 'GET', `/api/memory/recent?hours=${RECENT_HOURS}&categories=${encodeURIComponent(RECENT_CATEGORIES)}&limit=50`),
           // v4.19.0: structural lookup replaces semantic query for deferred-asks.
           // Same paradigm correction as v4.18.0 at the now-state slice.
           apiCall(apiKey, 'GET', '/api/memory/list?category=deferred-ask&limit=20'),
           apiCall(apiKey, 'GET', '/api/memory?category=substrate-health&key=heartbeat-current'),
-          apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`)
+          apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`),
+          // v4.20.0: raw substrate (conversation turns, tool events, file uploads).
+          apiCall(apiKey, 'GET', `/api/objects/recent?windowHours=${RAW_WINDOW_HOURS}&limit=${RAW_LIMIT}`)
         ]);
 
         // v4.18.0: RECENT SUBSTRATE corpus + active-episodes parsing from latest now/state.
@@ -1033,6 +1054,46 @@ async function handleTool(apiKey, name, args) {
           }
         }
 
+        // v4.20.0: RECENT RAW slice — small NOW-anchored sample of raw substrate.
+        // Per design-note/recent-raw-slice-v0-2026-05-06 +
+        //     principle/slices-anchor-on-now-llm-expands-2026-05-06.
+        // Reads cleo-api /api/objects/recent. The LLM expands via associative_recall
+        // when more context is needed.
+        output += `── RECENT RAW (LAST ${RAW_WINDOW_HOURS}H) ──\n`;
+        if (recentRawResult.status === 'fulfilled' && recentRawResult.value && Array.isArray(recentRawResult.value.objects)) {
+          const rawObjs = recentRawResult.value.objects;
+          if (rawObjs.length === 0) {
+            output += '  (no raw activity in window — substrate quiet or capture degraded)\n\n';
+          } else {
+            for (const o of rawObjs) {
+              const ts = o.ingested_at || o.timestamp;
+              const ageMs = ts ? (nowMs - new Date(ts).getTime()) : null;
+              const ageDisplay = ageMs == null
+                ? '?'
+                : ageMs < 60 * 1000
+                  ? Math.max(1, Math.floor(ageMs / 1000)) + 's'
+                  : ageMs < 60 * 60 * 1000
+                    ? Math.max(1, Math.floor(ageMs / (60 * 1000))) + 'm'
+                    : Math.floor(ageMs / (60 * 60 * 1000)) + 'h';
+              const speaker = o.speaker ? `[${o.speaker}]` : '';
+              const tool = o.tool_name ? ` ${o.tool_name}` : '';
+              const kind = o.source_type || 'object';
+              output += `  • ${ageDisplay} ago — ${kind}${tool} ${speaker}\n`;
+              const snippet = (o.content_snippet || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+              if (snippet) output += `    ${snippet}\n`;
+            }
+            const preFilter = recentRawResult.value.pre_filter_count;
+            if (typeof preFilter === 'number' && preFilter > rawObjs.length) {
+              output += `  (${preFilter - rawObjs.length} entries collapsed by noise filter)\n`;
+            }
+            output += '\n';
+          }
+        } else if (recentRawResult.status === 'rejected') {
+          output += `  ⚠ Raw substrate fetch failed: ${recentRawResult.reason && recentRawResult.reason.message || 'unknown error'}\n\n`;
+        } else {
+          output += '  (raw substrate unavailable)\n\n';
+        }
+
         // v4.17.0: Recent Architect-Responses slice — closes finding/findability-audit-may-5-2026 Finding 2
         // Surfaces resolution evidence so "pending X" claims in current_state can be cross-checked.
         output += '── RECENT ARCHITECT-RESPONSES (LAST 14 DAYS) ──\n';
@@ -1169,6 +1230,7 @@ async function handleTool(apiKey, name, args) {
         // Surface partial failures at the bottom so they don't get missed
         const errors = [];
         if (recentSubstrateResult.status === 'rejected') errors.push('recent_substrate query failed: ' + recentSubstrateResult.reason.message);
+        if (recentRawResult.status === 'rejected') errors.push('recent_raw query failed: ' + recentRawResult.reason.message);
         if (deferredAsksResult.status === 'rejected') errors.push('deferred_asks query failed: ' + deferredAsksResult.reason.message);
         if (healthResult.status === 'rejected') errors.push('health query failed: ' + healthResult.reason.message);
         if (upcomingResult.status === 'rejected') errors.push('upcoming query failed: ' + upcomingResult.reason.message);
