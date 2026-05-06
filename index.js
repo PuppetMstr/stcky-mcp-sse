@@ -1,6 +1,23 @@
 /**
  * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
+ * CHANGELOG v4.18.0:
+ * - REPLACED: CURRENT STATE slice → RECENT SUBSTRATE slice in organism_wake_up.
+ *   The slice paradigm asked a structural question ("most recent now/state")
+ *   and answered it via semantic similarity, recurring as the same bug shape
+ *   in v4.16.0, v4.17.0, and the May 6 wake-up (per finding/slice-paradigm-
+ *   misformed-for-structural-questions-2026-05-06). v4.18.0 removes the
+ *   structural-question framing entirely: surfaces the recent substrate as
+ *   a corpus, time-descending, across the curated category set. The LLM
+ *   reads it natively. The most-recent now/state surfaces at or near the
+ *   top automatically as a member of the corpus.
+ *   Implements vision/recent-substrate-as-primary-wake-up-surface-2026-05-06
+ *   (Steven's articulation: "the now substrate should always be what's been
+ *   going on right now"). Closes Groundhog-Day-Eli at the source.
+ *   Calls new cleo-api endpoint: GET /api/memory/recent.
+ *   Active episodes parsing now sources its now/state from the recent corpus
+ *   (first category=now entry) — same logic, different fetch path.
+ *
  * CHANGELOG v4.17.1:
  * - TUNE: architect-responses query was generic ("architect response chaos
  *   eli architecture decision call directive") and biased toward keyword
@@ -115,7 +132,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.17.1';
+const VERSION = '4.18.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -702,14 +719,13 @@ async function handleTool(apiKey, name, args) {
         const STALENESS_THRESHOLD_HOURS = 24;
         const nowMs = Date.now();
 
-        const [nowStateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
-          apiCall(apiKey, 'POST', '/api/associative', {
-            // v4.16.1: neutral query — recency sort in post-processing decides which now/state surfaces.
-            // Prior query 'now state canonical session current end of session' biased toward
-            // 'end-of-session' keyword match, surfacing yesterday's anchor over today's fresh one.
-            query: 'now state recent',
-            limit: 20
-          }),
+        // v4.18.0: RECENT SUBSTRATE replaces now-state slice.
+        // Structural query (categories + time window) — no semantic ranker, no slice paradigm.
+        // Per vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
+        const RECENT_HOURS = 36;
+        const RECENT_CATEGORIES = 'now,vision,principle,finding,design-note,self-note,decision,milestone,correction';
+        const [recentSubstrateResult, deferredAsksResult, healthResult, upcomingResult] = await Promise.allSettled([
+          apiCall(apiKey, 'GET', `/api/memory/recent?hours=${RECENT_HOURS}&categories=${encodeURIComponent(RECENT_CATEGORIES)}&limit=50`),
           apiCall(apiKey, 'POST', '/api/associative', {
             query: 'deferred ask unfulfilled pending overdue',
             limit: 10
@@ -718,25 +734,20 @@ async function handleTool(apiKey, name, args) {
           apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`)
         ]);
 
-        // CURRENT STATE — most recent now/state
-        let currentState = null;
+        // v4.18.0: RECENT SUBSTRATE corpus + active-episodes parsing from latest now/state.
+        // Time-descending, no semantic match. The LLM reads the corpus natively.
+        let recentSubstrate = [];
         let activeEpisodes = [];
-        if (nowStateResult.status === 'fulfilled' && nowStateResult.value.memories) {
-          const nowStates = nowStateResult.value.memories.filter(m => m.category === 'now');
-          if (nowStates.length > 0) {
-            nowStates.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-            const ns = nowStates[0];
-            const ageMs = nowMs - new Date(ns.updatedAt).getTime();
-            const ageHours = Math.floor(ageMs / (1000 * 60 * 60));
-            currentState = {
-              key: ns.key,
-              ts: new Date(ns.updatedAt).toISOString(),
-              age_hours: ageHours,
-              is_stale: ageHours >= STALENESS_THRESHOLD_HOURS,
-              excerpt: (ns.value || '').slice(0, 500)
-            };
-            // v4.14.0: extract @handles from now/state for active episodes slice
-            const handleMatches = (ns.value || '').match(/@[a-z][a-z0-9]*-[a-z0-9-]*[a-z0-9]/gi) || [];
+        if (recentSubstrateResult.status === 'fulfilled' && recentSubstrateResult.value && recentSubstrateResult.value.memories) {
+          recentSubstrate = recentSubstrateResult.value.memories
+            .slice()
+            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+
+          // Active episodes parsing: source from most-recent now/state in the corpus.
+          // Same logic as v4.14.0; just sourced from the new corpus path.
+          const latestNowState = recentSubstrate.find(m => m.category === 'now');
+          if (latestNowState) {
+            const handleMatches = (latestNowState.value || '').match(/@[a-z][a-z0-9]*-[a-z0-9-]*[a-z0-9]/gi) || [];
             const handleCounts = {};
             for (const h of handleMatches) {
               const lower = h.toLowerCase();
@@ -977,18 +988,36 @@ async function handleTool(apiKey, name, args) {
         // BUILD STRUCTURED OUTPUT
         let output = '═══ ORGANISM WAKE-UP PACKET ═══\n\n';
 
-        // Current State
-        output += '── CURRENT STATE ──\n';
-        if (currentState) {
-          const staleMarker = currentState.is_stale ? ` ⚠️ STALE (>${STALENESS_THRESHOLD_HOURS}h)` : '';
-          output += `Anchor: ${currentState.key}\n`;
-          output += `Age: ${currentState.age_hours}h${staleMarker}\n`;
-          output += `Excerpt:\n${currentState.excerpt}${currentState.excerpt.length >= 500 ? '...' : ''}\n\n`;
-          if (currentState.is_stale) {
-            output += `⚠️ Anchor is older than ${STALENESS_THRESHOLD_HOURS}h. The substrate has not been refreshed at recent session-end. Yesterday-Eli likely did not file an end-of-session now/state. Treat the anchor as a starting point but verify against recent activity (associative_recall on recent topics) to fill in what happened since the anchor was filed.\n\n`;
-          }
+        // v4.18.0: RECENT SUBSTRATE — corpus replaces single-record snapshot.
+        // Per vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
+        output += `── RECENT SUBSTRATE (LAST ${RECENT_HOURS}H) ──\n`;
+        if (recentSubstrate.length === 0) {
+          output += '⚠️ No substrate writes in the window. Either substrate is silent or capture is degraded. Consider checking substrate health or filing a now/state to seed the corpus.\n\n';
         } else {
-          output += '⚠️ No now/state found. Substrate has no current anchor. Consider filing one to start the session.\n\n';
+          for (const m of recentSubstrate) {
+            const ts = m.updatedAt || m.createdAt;
+            const ageMs = ts ? (nowMs - new Date(ts).getTime()) : null;
+            const ageDisplay = ageMs == null
+              ? '?'
+              : ageMs < 60 * 60 * 1000
+                ? Math.max(1, Math.floor(ageMs / (60 * 1000))) + 'm'
+                : Math.floor(ageMs / (60 * 60 * 1000)) + 'h';
+            output += `  • [${m.category}] ${m.key} (${ageDisplay} ago)\n`;
+            const excerpt = extractOneLine(m, 100);
+            if (excerpt) output += `    ${excerpt}\n`;
+          }
+          output += '\n';
+          // Surface the latest now/state's freshness as a one-line note (replaces the staleness flag's job).
+          const latestNs = recentSubstrate.find(m => m.category === 'now');
+          if (latestNs) {
+            const nsTs = latestNs.updatedAt || latestNs.createdAt;
+            const nsAgeH = nsTs ? Math.floor((nowMs - new Date(nsTs).getTime()) / (60 * 60 * 1000)) : null;
+            if (nsAgeH != null && nsAgeH >= STALENESS_THRESHOLD_HOURS) {
+              output += `⚠️ Latest now/state is ${nsAgeH}h old (≥${STALENESS_THRESHOLD_HOURS}h). End-of-session synthesis may have been missed. Recent corpus above still surfaces what's been going on; treat now/state as one entry, not the sole anchor.\n\n`;
+            }
+          } else {
+            output += '⚠️ No category=now in recent corpus. No session-end synthesis in window. Recent corpus still represents what\'s been going on.\n\n';
+          }
         }
 
         // v4.17.0: Recent Architect-Responses slice — closes finding/findability-audit-may-5-2026 Finding 2
@@ -1126,7 +1155,7 @@ async function handleTool(apiKey, name, args) {
 
         // Surface partial failures at the bottom so they don't get missed
         const errors = [];
-        if (nowStateResult.status === 'rejected') errors.push('now_state query failed: ' + nowStateResult.reason.message);
+        if (recentSubstrateResult.status === 'rejected') errors.push('recent_substrate query failed: ' + recentSubstrateResult.reason.message);
         if (deferredAsksResult.status === 'rejected') errors.push('deferred_asks query failed: ' + deferredAsksResult.reason.message);
         if (healthResult.status === 'rejected') errors.push('health query failed: ' + healthResult.reason.message);
         if (upcomingResult.status === 'rejected') errors.push('upcoming query failed: ' + upcomingResult.reason.message);
