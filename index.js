@@ -1,5 +1,5 @@
 /**
- * STCKY MCP SSE Server v4.13.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
+ * STCKY MCP SSE Server v4.20.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
  *
  * CHANGELOG v4.20.0:
  * - ADDED: RECENT RAW slice in organism_wake_up packet. Surfaces the raw
@@ -161,7 +161,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.20.0';
+const VERSION = '4.21.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -332,7 +332,19 @@ function renderEventAsText(evt) {
 }
 
 function fireAutoCaptureEvent(apiKey, evt) {
-  if (evt.tool_name === 'ingest') return;
+  // Reads are not substrate. Only writes and metadata-changing operations
+  // become tool_event records. Per May 8 vision: blob holds what goes IN
+  // through ingest; reads through search are ephemeral.
+  const READ_ONLY_TOOLS = new Set([
+    'ingest',              // recursion guard
+    'get_now',             // deprecated, pure read
+    'associative_recall',  // primary read path - ephemeral
+    'upcoming',            // forward sweep read - ephemeral
+    'organism_wake_up',    // packet read - ephemeral
+    'enrich',              // entity extraction read - ephemeral
+    'project_get',         // project lookup read - ephemeral
+  ]);
+  if (READ_ONLY_TOOLS.has(evt.tool_name)) return;
 
   const session = getSession(apiKey);
   const body = {
@@ -367,17 +379,15 @@ function fireAutoCaptureEvent(apiKey, evt) {
     console.error('[AUTO-CAPTURE] ingest failed for ' + evt.type + ' ' + evt.tool_name + ':', err.message);
   });
 }
-
 // =============================================================================
 // LEGACY AUTO-STORE (pre-v4.10.0 — curated enrich-based, kept for back-compat)
 // =============================================================================
 async function triggerAutoStore(apiKey, toolName, toolInput, toolResult) {
-  if (
-    toolName === 'enrich' ||
-    toolName === 'get_now' ||
-    toolName === 'set_timezone' ||
-    toolName === 'ingest'
-  ) return;
+  // v4.21.0: Disabled. Legacy curated capture path. Under May 8 one-door
+  // canon, the blob holds raw via auto-capture; secondary curation here
+  // duplicates and pollutes. Function kept as no-op to avoid touching
+  // call sites; remove in cleanup pass.
+  return;
 
   try {
     const inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput);
