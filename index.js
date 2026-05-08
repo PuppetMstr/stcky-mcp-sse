@@ -161,7 +161,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.21.0';
+const VERSION = '4.21.1';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -482,7 +482,7 @@ async function checkApiHealth(apiKey) {
 // CORE TOOLS
 // =============================================================================
 const TOOLS = [
-  {
+ {
     name: 'get_now',
     description: 'DEPRECATED as of v4.11.0 — every tool response now carries NOW time automatically. Kept for backward compatibility. Prefer calling associative_recall or any other tool instead; time comes free with every response.',
     inputSchema: { type: 'object', properties: {}, required: [] }
@@ -507,17 +507,6 @@ const TOOLS = [
       properties: {
         days: { type: 'number', description: 'How many days forward to sweep (default 30)' },
         limit: { type: 'number', description: 'Max items to return (default 20)' }
-      },
-      required: []
-    }
-  },
-  {
-    name: 'organism_wake_up',
-    description: 'ORGANISM BETA PHASE 2: mechanical structured wake-up packet. Single call returns current_state + forward_landscape + deferred_asks + substrate_health, replacing the multi-tool discipline-dependent session-start sequence. Surfaces stale current_state warnings (>24h old). Use at session start instead of calling associative_recall + upcoming separately. Defaults: days=30 for the forward landscape.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        days: { type: 'number', description: 'How many days forward to sweep for the forward_landscape (default 30)' }
       },
       required: []
     }
