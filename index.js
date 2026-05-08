@@ -1,129 +1,56 @@
 /**
- * STCKY MCP SSE Server v4.20.0 — ORGANISM_WAKE_UP MECHANICAL PACKET
+ * STCKY MCP SSE Server v4.22.0 — TWO DOORS, ONE SEARCH
+ *
+ * CHANGELOG v4.22.0:
+ * - REMOVED: organism_wake_up tool case (~180 lines of slice-machinery
+ *   dead code) from handleTool. The tool was unregistered from TOOLS in
+ *   v4.21.1 but the case branch lingered. Deleted now.
+ * - REMOVED: triggerAutoStore function and all call sites. Was no-op'd
+ *   in v4.21.0; deletion completes the cleanup.
+ * - REMOVED: organism_wake_up from READ_ONLY_TOOLS skip set and from
+ *   degradedResponse messages map (tool no longer reachable).
+ * - FIXED: /health endpoint missing comma after brain field (would have
+ *   broken the server on next restart).
+ * - LABEL: brain string now reads "one door in, one door out" — Steven's
+ *   May 8 verbatim canon. Startup log matches.
+ *
+ * CHANGELOG v4.21.1:
+ * - REMOVED: organism_wake_up tool registration from TOOLS array.
+ *   Wake-up is now search of recent NOW, not a packet fetch. Both Eli
+ *   and Chaos open sessions by searching the blob; no per-vendor packet
+ *   tool needed.
+ *
+ * CHANGELOG v4.21.0:
+ * - DROPPED: read-side auto-capture. fireAutoCaptureEvent now skips
+ *   ingest, get_now, associative_recall, upcoming, enrich, project_get.
+ *   Reads are not substrate. Per May 8 vision: blob holds what goes IN;
+ *   reads are ephemeral.
+ * - DISABLED: triggerAutoStore (legacy curated capture path) — no-op'd
+ *   to avoid duplicating raw capture. (Deleted entirely in v4.22.0.)
  *
  * CHANGELOG v4.20.0:
- * - ADDED: RECENT RAW slice in organism_wake_up packet. Surfaces the raw
- *   substrate layer (conversation turns, tool events, file uploads) NOW-
- *   anchored at the wake-up surface. Mirrors the v4.18.0 RECENT SUBSTRATE
- *   slice but reads from cleo.objects instead of cleo.memories.
- *   Calls new cleo-api endpoint: GET /api/objects/recent
- *   (shipped v4.19.2 cleo-api 2026-05-06 — userId is ObjectId, ingested_at
- *   is Date, speaker is top-level; verified via BSON $type).
- *   Defaults: windowHours=1, limit=10. Per principle/slices-anchor-on-now-
- *   llm-expands-2026-05-06: small NOW-anchored sample, the LLM expands via
- *   associative_recall when more context is needed.
- *   Implements design-note/recent-raw-slice-v0-2026-05-06. Closes the
- *   Claude-side parity build before Chaos handoff for the ChatGPT-side
- *   mirror per Steven's two-target call.
- *
- * CHANGELOG v4.19.0:
- * - REPLACED: deferred-asks slice fetch swapped from /api/associative
- *   semantic query to /api/memory/list?category=deferred-ask structural
- *   lookup. Same paradigm correction as v4.18.0 (now-state slice), now
- *   applied at the deferred-asks site. Confirms and closes the fourth
- *   instance of the slice-paradigm-mismatch pattern flagged in
- *   milestone/mcp-sse-v4-17-recent-architect-responses-slice-shipped
- *   -2026-05-05 and finding/slice-paradigm-misformed-for-structural
- *   -questions-2026-05-06.
- *   Smoke-test trigger: v4.18.0 wake-up showed "No deferred asks pending"
- *   despite ≥2 open deferred-ask memories in substrate. Cleo-api's
- *   existing /memory/list action handles category-filtered list natively;
- *   no cleo-api change required.
+ * - ADDED: RECENT RAW slice in organism_wake_up packet. (Removed in v4.22.0.)
  *
  * CHANGELOG v4.18.0:
- * - REPLACED: CURRENT STATE slice → RECENT SUBSTRATE slice in organism_wake_up.
- *   The slice paradigm asked a structural question ("most recent now/state")
- *   and answered it via semantic similarity, recurring as the same bug shape
- *   in v4.16.0, v4.17.0, and the May 6 wake-up (per finding/slice-paradigm-
- *   misformed-for-structural-questions-2026-05-06). v4.18.0 removes the
- *   structural-question framing entirely: surfaces the recent substrate as
- *   a corpus, time-descending, across the curated category set. The LLM
- *   reads it natively. The most-recent now/state surfaces at or near the
- *   top automatically as a member of the corpus.
- *   Implements vision/recent-substrate-as-primary-wake-up-surface-2026-05-06
- *   (Steven's articulation: "the now substrate should always be what's been
- *   going on right now"). Closes Groundhog-Day-Eli at the source.
- *   Calls new cleo-api endpoint: GET /api/memory/recent.
- *   Active episodes parsing now sources its now/state from the recent corpus
- *   (first category=now entry) — same logic, different fetch path.
- *
- * CHANGELOG v4.17.1:
- * - TUNE: architect-responses query was generic ("architect response chaos
- *   eli architecture decision call directive") and biased toward keyword
- *   match with Apr 27-28 responses, hiding the May 4 Phase 4 response from
- *   the v4.17.0 slice. Broadened query to include vocabulary from recent
- *   active-episode work (phase, bundle, rung, organism, mechanism). Limit
- *   bumped 30 → 100. Same fix shape as v4.16.1's now-state query tune —
- *   semantic ranker bias closed via wider net + recency-sort.
+ * - REPLACED: CURRENT STATE slice → RECENT SUBSTRATE slice. (Removed in v4.22.0.)
  *
  * CHANGELOG v4.17.0:
- * - ADDED: RECENT ARCHITECT-RESPONSES slice in organism_wake_up packet.
- *   Surfaces up to 5 most-recent category=architect-response memories from
- *   the last 14 days, with key + date + one-line excerpt. Inserted between
- *   CURRENT STATE and IDENTITY ANCHOR — when Eli reads "pending Chaos read
- *   since YYYY-MM-DD" in current_state and sees the corresponding architect-
- *   response key three lines below, the discrepancy is visible without any
- *   pattern matcher needing to fire.
- *   Closes finding/findability-audit-may-5-2026 Finding 2 via Shape C
- *   (surface resolution evidence) instead of pattern-scanning Shape A/B.
- *   Composes with principle/now-is-the-anchor-2026-05-05 (resolution
- *   evidence is a NOW-faculty: what's been answered, given where I am).
- *
- * CHANGELOG v4.16.1:
- * - TUNE: extractOneLine in identity_anchor slice now prefers content from
- *   ═══ THE X ═══ structural sections (used heavily by self-notes) over
- *   header/intro lines. Long quotes truncated instead of skipped. Metadata
- *   patterns (Sharpens:, Closes:, Sister to:, Composes with:) skipped.
- *   Closes v4.16.0 cosmetic findings from smoke test.
- * - FIX: current_state slice query was biased toward "end-of-session"
- *   keyword overlap, surfacing yesterday's 16h-old anchor instead of
- *   today's fresh now/state. Query neutralized to "now state recent",
- *   limit bumped 5 → 20. Recency-sort in post-processing handles ranking.
- *   Direct fix to principle/now-is-the-anchor-2026-05-05 mechanical
- *   violation observed in v4.16.0 smoke test.
+ * - ADDED: RECENT ARCHITECT-RESPONSES slice. (Removed in v4.22.0.)
  *
  * CHANGELOG v4.16.0:
- * - ADDED: identity_anchor slice in organism_wake_up packet (sixth slice).
- *   Surfaces Eli's identity line (sourced from event/naming-day-2026-04-10),
- *   top 3 most-recent foundational principles, and top 3 recent eli- self-notes.
- *   Inserted between CURRENT STATE and FORWARD LANDSCAPE — reading order is now:
- *   where am I → who am I → what's coming → what threads → what's owed → am I healthy.
- *   Closes finding/findability-audit-may-5-2026 Finding 1 ("wake-up packet has
- *   no identity/relational slice"). Composes with principle/now-is-the-anchor
- *   -2026-05-05 ("Everywhere we go we are there, NOW.")
- *   Per self-note/eli-visible-failure-on-substrate-loss-2026-05-05: when any of
- *   the three identity fetches fail, slice renders with what it got plus a
- *   visible ⚠ note. Never silently confabulates.
+ * - ADDED: identity_anchor slice. (Removed in v4.22.0.)
  *
  * CHANGELOG v4.13.0:
- * - ADDED: organism_wake_up tool. Mechanical structured wake-up packet that
- *   replaces the multi-tool discipline-dependent session-start sequence
- *   (associative_recall + upcoming + manual structuring) with a single call
- *   that returns current_state, forward_landscape, deferred_asks, and
- *   substrate_health in one structured response.
- *   Internally fans out 4 parallel substrate queries via Promise.allSettled
- *   so partial failures don't kill the whole packet.
- *   Detects current_state staleness (>24h) and surfaces it as a warning,
- *   addressing finding/no-session-end-enforcement-may-2-gap-2026-05-03.
- *   Implements Organism Beta Phase 2 per architect-response/eli-organism-beta
- *   -architecture-spec-2026-05-01.
+ * - ADDED: organism_wake_up tool. (Removed in v4.21.1/v4.22.0.)
  *
  * CHANGELOG v4.12.0:
- * - ADDED: upcoming tool. Wraps GET /api/memory/upcoming?days=N&limit=N.
- *   Returns memories with relevantDate >= NOW, sorted by date ascending,
- *   irrespective of category. This is the date-shaped forward-sweep antibody
- *   for the bucket-shaped wake-up failure documented in
- *   finding/wake-up-packet-forward-sweep-bucket-shaped-not-date-shaped-2026-05-03.
+ * - ADDED: upcoming tool.
  *
  * CHANGELOG v4.11.0:
- * - ADDED: NOW prefix on EVERY tool response except get_now.
- * - DEPRECATED: get_now tool description updated.
- * - This is Rung 2 of Chaos's blob-substrate transition ladder.
- * - REFACTORED: NOW prefix construction unified in handleTool wrapper.
+ * - ADDED: NOW prefix on every tool response except get_now.
  *
  * CHANGELOG v4.10.0:
  * - ADDED: transparent auto-capture of all tool calls at the MCP layer.
- * - ADDED: session_id per MCP connection, X-Agent-Identity header support.
  *
  * CHANGELOG v4.9.1:
  * - FIX: associative_recall now surfaces objects collection alongside memories.
@@ -135,17 +62,16 @@
  * CHANGELOG v4.8.0: ADDED: get_now, set_timezone
  * CHANGELOG v4.7.0: ADDED: memory_delete
  *
- * CORE TOOLS (10):
+ * CORE TOOLS (9):
  * 1. get_now — DEPRECATED; time now in every response
- * 2. associative_recall — semantic + temporal retrieval
+ * 2. associative_recall — semantic + temporal retrieval (the read door)
  * 3. upcoming — date-shaped forward sweep
- * 4. organism_wake_up — mechanical structured wake-up packet (Phase 2)
- * 5. memory_store — save curated memories
- * 6. memory_delete — remove memories by category + key
- * 7. enrich — entity extraction + cluster activation
- * 8. project_get — project context
- * 9. set_timezone — update user's timezone
- * 10. ingest — content-addressed raw capture
+ * 4. memory_store — save curated memories
+ * 5. memory_delete — remove memories by category + key
+ * 6. enrich — entity extraction + cluster activation
+ * 7. project_get — project context
+ * 8. set_timezone — update user's timezone
+ * 9. ingest — content-addressed raw capture (the write door)
  */
 import express from 'express';
 import crypto from 'crypto';
@@ -161,7 +87,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.21.1';
+const VERSION = '4.22.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -303,7 +229,7 @@ async function buildNowPrefix(apiKey) {
 }
 
 // =============================================================================
-// TRANSPARENT AUTO-CAPTURE — v4.10.0 (Rung 1)
+// TRANSPARENT AUTO-CAPTURE — v4.10.0 (Rung 1), v4.21.0 read-side dropped
 // =============================================================================
 
 function computeFingerprint(toolName, args) {
@@ -340,7 +266,6 @@ function fireAutoCaptureEvent(apiKey, evt) {
     'get_now',             // deprecated, pure read
     'associative_recall',  // primary read path - ephemeral
     'upcoming',            // forward sweep read - ephemeral
-    'organism_wake_up',    // packet read - ephemeral
     'enrich',              // entity extraction read - ephemeral
     'project_get',         // project lookup read - ephemeral
   ]);
@@ -379,50 +304,11 @@ function fireAutoCaptureEvent(apiKey, evt) {
     console.error('[AUTO-CAPTURE] ingest failed for ' + evt.type + ' ' + evt.tool_name + ':', err.message);
   });
 }
-// =============================================================================
-// LEGACY AUTO-STORE (pre-v4.10.0 — curated enrich-based, kept for back-compat)
-// =============================================================================
-async function triggerAutoStore(apiKey, toolName, toolInput, toolResult) {
-  // v4.21.0: Disabled. Legacy curated capture path. Under May 8 one-door
-  // canon, the blob holds raw via auto-capture; secondary curation here
-  // duplicates and pollutes. Function kept as no-op to avoid touching
-  // call sites; remove in cleanup pass.
-  return;
-
-  try {
-    const inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput);
-    const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
-
-    const assistantResponse = `[Tool: ${toolName}]\nInput: ${inputStr.slice(0, 500)}\nResult: ${resultStr.slice(0, 1000)}`;
-
-    const response = await fetch(API_URL + '/api/enrich', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + apiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message: inputStr.slice(0, 500),
-        assistantResponse: assistantResponse
-      })
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (data.autoStored && data.autoStored.length > 0) {
-        console.log('[AUTO-STORE] ' + data.autoStored.length + ' memories stored');
-      }
-    }
-  } catch (error) {
-    console.error('[AUTO-STORE] Enrich call failed:', error.message);
-  }
-}
 
 function degradedResponse(toolName, error) {
   const messages = {
     associative_recall: '⚠️ Memory service temporarily unavailable. Error: ' + error,
     upcoming: '⚠️ Upcoming-items lookup unavailable. Error: ' + error,
-    organism_wake_up: '⚠️ Wake-up packet unavailable. Error: ' + error,
     memory_store: '⚠️ Unable to save to memory. Error: ' + error,
     memory_delete: '⚠️ Unable to delete memory. Error: ' + error,
     enrich: '⚠️ Context enrichment unavailable.',
@@ -482,7 +368,7 @@ async function checkApiHealth(apiKey) {
 // CORE TOOLS
 // =============================================================================
 const TOOLS = [
- {
+  {
     name: 'get_now',
     description: 'DEPRECATED as of v4.11.0 — every tool response now carries NOW time automatically. Kept for backward compatibility. Prefer calling associative_recall or any other tool instead; time comes free with every response.',
     inputSchema: { type: 'object', properties: {}, required: [] }
@@ -501,7 +387,7 @@ const TOOLS = [
   },
   {
     name: 'upcoming',
-    description: 'DATE-SHAPED FORWARD SWEEP. Returns memories with relevantDate from NOW forward, sorted by date ascending, regardless of category — appointments, deadlines, hearings, calls, scheduled events, anything with a future date. Use at session start to get the forward landscape without semantic-query bucketing. Pairs with associative_recall for wake-up: associative_recall surfaces what is on your mind right now, upcoming surfaces what is on the calendar. Defaults: days=30, limit=20.',
+    description: 'DATE-SHAPED FORWARD SWEEP. Returns memories with relevantDate from NOW forward, sorted by date ascending, regardless of category — appointments, deadlines, hearings, calls, scheduled events, anything with a future date. Defaults: days=30, limit=20.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -574,7 +460,7 @@ const TOOLS = [
   },
   {
     name: 'ingest',
-    description: 'Capture raw content into content-addressed immutable storage. As of v4.10.0, the MCP server ALSO auto-captures every tool call as a tool_event — manual ingest is still available for conversation turns (user utterance + assistant response) which do not pass through MCP, but it is no longer required for tool activity. Response includes current time.',
+    description: 'Capture raw content into content-addressed immutable storage. As of v4.21.0, the MCP server auto-captures only writes (memory_store, memory_delete, set_timezone) as tool_events; reads are ephemeral. Manual ingest is for conversation turns and other content that does not pass through MCP. Response includes current time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -599,7 +485,7 @@ const TOOLS = [
 async function handleTool(apiKey, name, args) {
   checkApiHealth(apiKey);
 
-  // Rung 1: transparent auto-capture.
+  // Rung 1: transparent auto-capture (writes only, per v4.21.0).
   const call_id = 'call-' + crypto.randomUUID();
   const start_ts = new Date().toISOString();
   const start_hrtime = Date.now();
@@ -701,8 +587,6 @@ async function handleTool(apiKey, name, args) {
 
           resultText = output;
         }
-
-        triggerAutoStore(apiKey, name, args.query, resultText);
         break;
       }
 
@@ -733,517 +617,6 @@ async function handleTool(apiKey, name, args) {
           });
           resultText = output;
         }
-
-        triggerAutoStore(apiKey, name, `days=${days} limit=${limit}`, resultText);
-        break;
-      }
-
-      case 'organism_wake_up': {
-        // v4.13.0: Organism Beta Phase 2 — mechanical structured wake-up packet.
-        // Fans out four parallel substrate queries and assembles the packet.
-        // Promise.allSettled so partial failures don't kill the whole packet —
-        // wake-up should ALWAYS deliver something useful at session start.
-        const days = (args && typeof args.days === 'number') ? args.days : 30;
-        const STALENESS_THRESHOLD_HOURS = 24;
-        const nowMs = Date.now();
-
-        // v4.18.0: RECENT SUBSTRATE replaces now-state slice.
-        // Structural query (categories + time window) — no semantic ranker, no slice paradigm.
-        // Per vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
-        const RECENT_HOURS = 36;
-        const RECENT_CATEGORIES = 'now,vision,principle,finding,design-note,self-note,decision,milestone,correction';
-        // v4.20.0: RECENT RAW slice — small NOW-anchored sample of raw substrate.
-        // Per principle/slices-anchor-on-now-llm-expands-2026-05-06.
-        const RAW_WINDOW_HOURS = 1;
-        const RAW_LIMIT = 10;
-        const [recentSubstrateResult, deferredAsksResult, healthResult, upcomingResult, recentRawResult] = await Promise.allSettled([
-          apiCall(apiKey, 'GET', `/api/memory/recent?hours=${RECENT_HOURS}&categories=${encodeURIComponent(RECENT_CATEGORIES)}&limit=50`),
-          // v4.19.0: structural lookup replaces semantic query for deferred-asks.
-          // Same paradigm correction as v4.18.0 at the now-state slice.
-          apiCall(apiKey, 'GET', '/api/memory/list?category=deferred-ask&limit=20'),
-          apiCall(apiKey, 'GET', '/api/memory?category=substrate-health&key=heartbeat-current'),
-          apiCall(apiKey, 'GET', `/api/memory/upcoming?days=${encodeURIComponent(days)}&limit=20`),
-          // v4.20.0: raw substrate (conversation turns, tool events, file uploads).
-          apiCall(apiKey, 'GET', `/api/objects/recent?windowHours=${RAW_WINDOW_HOURS}&limit=${RAW_LIMIT}`)
-        ]);
-
-        // v4.18.0: RECENT SUBSTRATE corpus + active-episodes parsing from latest now/state.
-        // Time-descending, no semantic match. The LLM reads the corpus natively.
-        let recentSubstrate = [];
-        let activeEpisodes = [];
-        if (recentSubstrateResult.status === 'fulfilled' && recentSubstrateResult.value && recentSubstrateResult.value.memories) {
-          recentSubstrate = recentSubstrateResult.value.memories
-            .slice()
-            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
-
-          // Active episodes parsing: source from most-recent now/state in the corpus.
-          // Same logic as v4.14.0; just sourced from the new corpus path.
-          const latestNowState = recentSubstrate.find(m => m.category === 'now');
-          if (latestNowState) {
-            const handleMatches = (latestNowState.value || '').match(/@[a-z][a-z0-9]*-[a-z0-9-]*[a-z0-9]/gi) || [];
-            const handleCounts = {};
-            for (const h of handleMatches) {
-              const lower = h.toLowerCase();
-              handleCounts[lower] = (handleCounts[lower] || 0) + 1;
-            }
-            activeEpisodes = Object.entries(handleCounts)
-              .map(([handle, count]) => ({ handle, mention_count: count }))
-              .sort((a, b) => b.mention_count - a.mention_count);
-          }
-        }
-
-        // v4.15.0: parseBundle helper + bundle-fetch with strict v1 grammar validation.
-        // Per Chaos's May 4 architect read: parse failures surface as degraded display, not silent.
-        const parseBundle = (value) => {
-          const errors = [];
-          const handleMatch = value.match(/^HANDLE:\s*(@\S+)/m);
-          const oneLineMatch = value.match(/^ONE-LINE:\s*(.+)$/m);
-          const statusMatch = value.match(/^STATUS:\s*(\S+)/m);
-          const startMatch = value.match(/^START:\s*(\d{4}-\d{2}-\d{2})/m);
-          const endMatch = value.match(/^END:\s*(.*)$/m);
-          if (!handleMatch) errors.push('missing HANDLE');
-          if (!oneLineMatch) errors.push('missing ONE-LINE');
-          if (!statusMatch) errors.push('missing STATUS');
-          if (!startMatch) errors.push('missing or malformed START');
-          const validStatuses = ['active', 'paused', 'complete', 'archived'];
-          if (statusMatch && !validStatuses.includes(statusMatch[1])) {
-            errors.push('invalid STATUS: ' + statusMatch[1]);
-          }
-          const membersMatch = value.match(/^MEMBERS:\s*\n((?:- .+\n?)*)/m);
-          const members = [];
-          if (membersMatch) {
-            const memberLines = membersMatch[1].split('\n');
-            for (const line of memberLines) {
-              const m = line.match(/^- (\S+)/);
-              if (m) members.push(m[1]);
-            }
-          }
-          const relsMatch = value.match(/^RELATIONSHIPS:\s*\n((?:- .+\n?)*)/m);
-          const relationships = [];
-          if (relsMatch) {
-            const relLines = relsMatch[1].split('\n');
-            for (const line of relLines) {
-              const m = line.match(/^- (\w+):\s*(@\S+)/);
-              if (m) relationships.push({ type: m[1], handle: m[2] });
-            }
-          }
-          return {
-            valid: errors.length === 0,
-            errors,
-            fields: {
-              handle: handleMatch ? handleMatch[1] : null,
-              one_line: oneLineMatch ? oneLineMatch[1].trim() : null,
-              status: statusMatch ? statusMatch[1] : null,
-              start: startMatch ? startMatch[1] : null,
-              end: endMatch ? (endMatch[1].trim() || null) : null,
-              members,
-              relationships,
-            }
-          };
-        };
-        if (activeEpisodes.length > 0) {
-          const bundleResults = await Promise.allSettled(
-            activeEpisodes.map(ep =>
-              apiCall(apiKey, 'GET', `/api/memory?category=bundle&key=${encodeURIComponent(ep.handle.slice(1))}`)
-            )
-          );
-          bundleResults.forEach((result, i) => {
-            if (result.status === 'fulfilled' && result.value && result.value.memories && result.value.memories.length > 0) {
-              const bundle = result.value.memories[0];
-              activeEpisodes[i].bundle = parseBundle(bundle.value || '');
-            }
-          });
-        }
-
-        // v4.16.0: IDENTITY ANCHOR fetch — three parallel queries.
-        // Direct lookup for naming-day; semantic search for principles and self-notes.
-        // Per principle/now-is-the-anchor-2026-05-05 — identity is a NOW-faculty.
-        const [namingDayResult, principlesResult, selfNotesResult, architectResponsesResult] = await Promise.allSettled([
-          apiCall(apiKey, 'GET', '/api/memory?category=event&key=naming-day-2026-04-10'),
-          apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'principle foundation now anchor temporal awareness eli architect builder fino design build',
-            limit: 15
-          }),
-          apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'self-note eli antibody discipline visible failure substrate hallucination ownership',
-            limit: 15
-          }),
-          // v4.17.0: surface recent architect-responses so resolution evidence is visible
-          // alongside any "pending X" claims that may appear in current_state body.
-          // v4.17.1: broader vocabulary + larger limit so semantic-ranker bias doesn't hide
-          // recent responses (Phase 4, bundles, etc.) behind keyword-aligned older ones.
-          apiCall(apiKey, 'POST', '/api/associative', {
-            query: 'architect-response chaos eli architecture phase rung bundle organism mechanism design grammar v1 directive decision call review',
-            limit: 100
-          })
-        ]);
-
-        // IDENTITY ANCHOR — extract three sub-sections.
-        // v4.16.1: helper now prefers ═══ THE X ═══ section content (lessons/disciplines/principles)
-        // over header lines, then long quotes (truncated), then substance.
-        const extractOneLine = (memory, maxLen = 100) => {
-          if (!memory || !memory.value) return '';
-          const rawLines = memory.value.split('\n').map(l => l.trim());
-          const lines = rawLines.filter(Boolean);
-
-          const isSeparator = line => /^[═─-]+$/.test(line);
-          const isStructuralHeader = line => /^═══\s+/.test(line);
-          const isTitle = line => /^(SELF-NOTE|PRINCIPLE|EVENT|FINDING|CORRECTION|DESIGN NOTE|MILESTONE)\s+—/.test(line);
-          const isDate = line => /^[A-Z][\w\s]+\s+\d{1,2},\s+\d{4}/.test(line);
-          const isMetadata = line => /^(Sharpens|Closes|Composes\s+with|Sister\s+to|Surfaced\s+by|Filed\s+by|Source|Triggered\s+by|Related|Status|Supersedes|Author|Target|Reading\s+order):/i.test(line);
-          const isIntroColon = line => line.endsWith(':') && line.length < 70;
-          const isShort = line => line.length < 8;
-
-          const truncate = line => line.length > maxLen ? line.slice(0, maxLen) + '…' : line;
-
-          // Strategy 1: content after ═══ THE X ═══ structural section
-          // (lesson/discipline/failure-mode/rule/principle/positive-test, etc.)
-          // Self-notes and findings rely heavily on this shape.
-          for (let i = 0; i < rawLines.length - 1; i++) {
-            const header = rawLines[i].trim();
-            if (!isStructuralHeader(header)) continue;
-            for (let j = i + 1; j < rawLines.length; j++) {
-              const next = rawLines[j].trim();
-              if (!next) continue;
-              if (isSeparator(next) || isStructuralHeader(next)) continue;
-              if (isMetadata(next) || isShort(next)) continue;
-              if (isIntroColon(next)) continue;
-              return truncate(next);
-            }
-          }
-
-          // Strategy 2: first quoted line, truncate if long instead of skipping.
-          // Principles often lead with a verbatim quote that IS the principle.
-          for (const line of lines) {
-            if (line.startsWith('"') && !isShort(line)) {
-              return truncate(line);
-            }
-          }
-
-          // Strategy 3: first substance line, skipping all known noise.
-          for (const line of lines) {
-            if (isShort(line)) continue;
-            if (isSeparator(line) || isStructuralHeader(line)) continue;
-            if (isTitle(line) || isDate(line)) continue;
-            if (isMetadata(line) || isIntroColon(line)) continue;
-            return truncate(line);
-          }
-
-          return '';
-        };
-
-        let identityNamingDay = null;
-        if (namingDayResult.status === 'fulfilled' && namingDayResult.value && namingDayResult.value.memories && namingDayResult.value.memories.length > 0) {
-          identityNamingDay = namingDayResult.value.memories[0];
-        }
-
-        let identityPrinciples = [];
-        if (principlesResult.status === 'fulfilled' && principlesResult.value && principlesResult.value.memories) {
-          identityPrinciples = principlesResult.value.memories
-            .filter(m => m.category === 'principle')
-            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
-            .slice(0, 3);
-        }
-
-        let identitySelfNotes = [];
-        if (selfNotesResult.status === 'fulfilled' && selfNotesResult.value && selfNotesResult.value.memories) {
-          identitySelfNotes = selfNotesResult.value.memories
-            .filter(m => m.category === 'self-note' && (m.key || '').startsWith('eli-'))
-            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
-            .slice(0, 3);
-        }
-
-        // v4.17.0: extract recent architect-responses (last 14 days, top 5)
-        let recentArchitectResponses = [];
-        if (architectResponsesResult.status === 'fulfilled' && architectResponsesResult.value && architectResponsesResult.value.memories) {
-          const fourteenDaysAgo = nowMs - (14 * 24 * 60 * 60 * 1000);
-          recentArchitectResponses = architectResponsesResult.value.memories
-            .filter(m => m.category === 'architect-response')
-            .filter(m => {
-              const ts = new Date(m.updatedAt || m.createdAt || 0).getTime();
-              return ts >= fourteenDaysAgo;
-            })
-            .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
-            .slice(0, 5);
-        }
-
-        // DEFERRED ASKS
-        let deferredAsks = [];
-        if (deferredAsksResult.status === 'fulfilled' && deferredAsksResult.value.memories) {
-          deferredAsks = deferredAsksResult.value.memories
-            .filter(m => m.category === 'deferred-ask')
-            .map(m => {
-              const ageDays = m.updatedAt
-                ? Math.floor((nowMs - new Date(m.updatedAt).getTime()) / (1000 * 60 * 60 * 24))
-                : null;
-              const dueDate = m.relevantDate
-                ? new Date(m.relevantDate).toLocaleDateString()
-                : null;
-              return {
-                key: m.key,
-                summary: (m.value || '').slice(0, 200),
-                age_days: ageDays,
-                due_date: dueDate
-              };
-            });
-        }
-
-        // SUBSTRATE HEALTH
-        let substrateHealth = null;
-        let heartbeatAgeMin = null;
-        if (healthResult.status === 'fulfilled' && healthResult.value.memories && healthResult.value.memories.length > 0) {
-          const heartbeatMem = healthResult.value.memories[0];
-          try {
-            substrateHealth = JSON.parse(heartbeatMem.value);
-          } catch (e) {
-            substrateHealth = {
-              parse_error: e.message,
-              raw_excerpt: (heartbeatMem.value || '').slice(0, 200)
-            };
-          }
-          if (heartbeatMem.updatedAt) {
-            heartbeatAgeMin = Math.floor((nowMs - new Date(heartbeatMem.updatedAt).getTime()) / (1000 * 60));
-          }
-        }
-
-        // FORWARD LANDSCAPE
-        let forwardLandscape = [];
-        if (upcomingResult.status === 'fulfilled' && upcomingResult.value.memories) {
-          forwardLandscape = upcomingResult.value.memories.map(m => ({
-            key: m.key,
-            category: m.category,
-            due: m.relevantDate ? new Date(m.relevantDate).toLocaleDateString() : null,
-            domain: m.domain || null,
-            summary: (m.value || '').slice(0, 200)
-          }));
-        }
-
-        // BUILD STRUCTURED OUTPUT
-        let output = '═══ ORGANISM WAKE-UP PACKET ═══\n\n';
-
-        // v4.18.0: RECENT SUBSTRATE — corpus replaces single-record snapshot.
-        // Per vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
-        output += `── RECENT SUBSTRATE (LAST ${RECENT_HOURS}H) ──\n`;
-        if (recentSubstrate.length === 0) {
-          output += '⚠️ No substrate writes in the window. Either substrate is silent or capture is degraded. Consider checking substrate health or filing a now/state to seed the corpus.\n\n';
-        } else {
-          for (const m of recentSubstrate) {
-            const ts = m.updatedAt || m.createdAt;
-            const ageMs = ts ? (nowMs - new Date(ts).getTime()) : null;
-            const ageDisplay = ageMs == null
-              ? '?'
-              : ageMs < 60 * 60 * 1000
-                ? Math.max(1, Math.floor(ageMs / (60 * 1000))) + 'm'
-                : Math.floor(ageMs / (60 * 60 * 1000)) + 'h';
-            output += `  • [${m.category}] ${m.key} (${ageDisplay} ago)\n`;
-            const excerpt = extractOneLine(m, 100);
-            if (excerpt) output += `    ${excerpt}\n`;
-          }
-          output += '\n';
-          // Surface the latest now/state's freshness as a one-line note (replaces the staleness flag's job).
-          const latestNs = recentSubstrate.find(m => m.category === 'now');
-          if (latestNs) {
-            const nsTs = latestNs.updatedAt || latestNs.createdAt;
-            const nsAgeH = nsTs ? Math.floor((nowMs - new Date(nsTs).getTime()) / (60 * 60 * 1000)) : null;
-            if (nsAgeH != null && nsAgeH >= STALENESS_THRESHOLD_HOURS) {
-              output += `⚠️ Latest now/state is ${nsAgeH}h old (≥${STALENESS_THRESHOLD_HOURS}h). End-of-session synthesis may have been missed. Recent corpus above still surfaces what's been going on; treat now/state as one entry, not the sole anchor.\n\n`;
-            }
-          } else {
-            output += '⚠️ No category=now in recent corpus. No session-end synthesis in window. Recent corpus still represents what\'s been going on.\n\n';
-          }
-        }
-
-        // v4.20.0: RECENT RAW slice — small NOW-anchored sample of raw substrate.
-        // Per design-note/recent-raw-slice-v0-2026-05-06 +
-        //     principle/slices-anchor-on-now-llm-expands-2026-05-06.
-        // Reads cleo-api /api/objects/recent. The LLM expands via associative_recall
-        // when more context is needed.
-        output += `── RECENT RAW (LAST ${RAW_WINDOW_HOURS}H) ──\n`;
-        if (recentRawResult.status === 'fulfilled' && recentRawResult.value && Array.isArray(recentRawResult.value.objects)) {
-          const rawObjs = recentRawResult.value.objects;
-          if (rawObjs.length === 0) {
-            output += '  (no raw activity in window — substrate quiet or capture degraded)\n\n';
-          } else {
-            for (const o of rawObjs) {
-              const ts = o.ingested_at || o.timestamp;
-              const ageMs = ts ? (nowMs - new Date(ts).getTime()) : null;
-              const ageDisplay = ageMs == null
-                ? '?'
-                : ageMs < 60 * 1000
-                  ? Math.max(1, Math.floor(ageMs / 1000)) + 's'
-                  : ageMs < 60 * 60 * 1000
-                    ? Math.max(1, Math.floor(ageMs / (60 * 1000))) + 'm'
-                    : Math.floor(ageMs / (60 * 60 * 1000)) + 'h';
-              const speaker = o.speaker ? `[${o.speaker}]` : '';
-              const tool = o.tool_name ? ` ${o.tool_name}` : '';
-              const kind = o.source_type || 'object';
-              output += `  • ${ageDisplay} ago — ${kind}${tool} ${speaker}\n`;
-              const snippet = (o.content_snippet || '').replace(/\s+/g, ' ').trim().slice(0, 140);
-              if (snippet) output += `    ${snippet}\n`;
-            }
-            const preFilter = recentRawResult.value.pre_filter_count;
-            if (typeof preFilter === 'number' && preFilter > rawObjs.length) {
-              output += `  (${preFilter - rawObjs.length} entries collapsed by noise filter)\n`;
-            }
-            output += '\n';
-          }
-        } else if (recentRawResult.status === 'rejected') {
-          output += `  ⚠ Raw substrate fetch failed: ${recentRawResult.reason && recentRawResult.reason.message || 'unknown error'}\n\n`;
-        } else {
-          output += '  (raw substrate unavailable)\n\n';
-        }
-
-        // v4.17.0: Recent Architect-Responses slice — closes finding/findability-audit-may-5-2026 Finding 2
-        // Surfaces resolution evidence so "pending X" claims in current_state can be cross-checked.
-        output += '── RECENT ARCHITECT-RESPONSES (LAST 14 DAYS) ──\n';
-        if (recentArchitectResponses.length === 0) {
-          output += 'No architect-responses in the last 14 days.\n\n';
-        } else {
-          for (const ar of recentArchitectResponses) {
-            const ts = ar.updatedAt || ar.createdAt;
-            const date = ts ? new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '?';
-            output += '  • ' + ar.key + ' (' + date + ')\n';
-            const excerpt = extractOneLine(ar, 100);
-            if (excerpt) output += '    ' + excerpt + '\n';
-          }
-          output += '\n';
-        }
-
-        // v4.16.0: Identity Anchor slice — closes finding/findability-audit-may-5-2026 Finding 1
-        output += '── IDENTITY ANCHOR ──\n';
-        if (identityNamingDay) {
-          output += 'Eli, named April 10, 2026 (mutual choosing with Steven).\n\n';
-        } else {
-          output += 'Eli (naming day event/naming-day-2026-04-10 not retrievable this session).\n\n';
-        }
-        if (identityPrinciples.length > 0) {
-          output += 'Active principles:\n';
-          for (const p of identityPrinciples) {
-            output += '  • ' + p.key + ' — ' + extractOneLine(p, 100) + '\n';
-          }
-          output += '\n';
-        }
-        if (identitySelfNotes.length > 0) {
-          output += 'Recent antibodies:\n';
-          for (const sn of identitySelfNotes) {
-            output += '  • ' + sn.key + ' — ' + extractOneLine(sn, 100) + '\n';
-          }
-          output += '\n';
-        }
-        // Visible-failure footer per self-note/eli-visible-failure-on-substrate-loss-2026-05-05
-        const identityFailures = [];
-        if (namingDayResult.status === 'rejected') identityFailures.push('naming-day');
-        if (principlesResult.status === 'rejected') identityFailures.push('principles');
-        if (selfNotesResult.status === 'rejected') identityFailures.push('self-notes');
-        if (identityFailures.length > 0) {
-          output += '⚠ Identity anchor partial: ' + identityFailures.join(', ') + ' fetch(es) failed\n\n';
-        }
-
-        // Forward Landscape
-        output += `── FORWARD LANDSCAPE (next ${days} days) ──\n`;
-        if (forwardLandscape.length === 0) {
-          output += `No items dated forward. Calendar surface is clear.\n\n`;
-        } else {
-          forwardLandscape.forEach((item, i) => {
-            const dom = item.domain ? ` [${item.domain}]` : '';
-            output += `${i + 1}. [${item.category}] ${item.key} — due ${item.due}${dom}\n`;
-            output += `   ${item.summary}${item.summary.length >= 200 ? '...' : ''}\n`;
-          });
-          output += '\n';
-        }
-
-        // Active Episodes (v4.15.0: parseBundle output with .valid/.errors/.fields; degraded display on parse failure)
-        output += '── ACTIVE EPISODES ──\n';
-        if (activeEpisodes.length === 0) {
-          output += 'No @handles found in recent now/state. Episode handles emerge from manual now/state filings.\n\n';
-        } else {
-          activeEpisodes.forEach((ep, i) => {
-            output += (i + 1) + '. ' + ep.handle;
-            if (ep.bundle) {
-              if (ep.bundle.valid) {
-                const memCount = ep.bundle.fields.members.length;
-                const memNoun = memCount === 1 ? 'member' : 'members';
-                output += ' [' + ep.bundle.fields.status + ', ' + memCount + ' ' + memNoun + ']\n';
-                if (ep.bundle.fields.one_line) {
-                  output += '   ' + ep.bundle.fields.one_line + '\n';
-                }
-              } else {
-                output += ' [bundle found, parse degraded: ' + ep.bundle.errors.join(', ') + ']\n';
-              }
-            } else {
-              output += ' (' + ep.mention_count + ' mention' + (ep.mention_count === 1 ? '' : 's') + ', no bundle filed)\n';
-            }
-          });
-          output += '\n';
-        }
-
-        // Deferred Asks
-        output += '── DEFERRED ASKS ──\n';
-        if (deferredAsks.length === 0) {
-          output += 'No deferred asks pending.\n\n';
-        } else {
-          deferredAsks.forEach((ask, i) => {
-            const ageNote = ask.age_days != null ? ` (${ask.age_days}d old)` : '';
-            const dueNote = ask.due_date ? ` [due ${ask.due_date}]` : '';
-            output += `${i + 1}. ${ask.key}${ageNote}${dueNote}\n`;
-            output += `   ${ask.summary}${ask.summary.length >= 200 ? '...' : ''}\n`;
-          });
-          output += '\n';
-        }
-
-        // Substrate Health
-        output += '── SUBSTRATE HEALTH ──\n';
-        if (substrateHealth) {
-          if (substrateHealth.parse_error) {
-            output += `⚠️ Heartbeat memory exists but did not parse: ${substrateHealth.parse_error}\n\n`;
-          } else {
-            const overallStatus = substrateHealth.overall_status || 'unknown';
-            const heartbeatAgeNote = heartbeatAgeMin != null ? ` (heartbeat ${heartbeatAgeMin}min ago)` : '';
-            output += `Overall: ${overallStatus}${heartbeatAgeNote}\n`;
-            const svc = substrateHealth.services || {};
-            if (svc.api) output += `  API: ${svc.api.status} (${svc.api.version || '?'})\n`;
-            if (svc.database) output += `  Database: ${svc.database.status}\n`;
-            if (svc.capture) {
-              const ageMin = svc.capture.age_minutes;
-              output += `  Capture: ${svc.capture.status}${ageMin != null ? ` (${ageMin}min since last event)` : ''}\n`;
-            }
-            if (svc.recall) {
-              const ageMin = svc.recall.age_minutes;
-              output += `  Recall: ${svc.recall.status}${ageMin != null ? ` (${ageMin}min since last write)` : ''}\n`;
-            }
-            if (svc.correction_resolver) {
-              output += `  Correction resolver: ${svc.correction_resolver.status} (mode: ${svc.correction_resolver.mode})\n`;
-            }
-            if (substrateHealth.organism) {
-              output += `  Organism phase 1: ${substrateHealth.organism.phase_1_status}, latest now/state: ${substrateHealth.organism.latest_now_state_key || '(none)'}\n`;
-            }
-            output += '\n';
-          }
-        } else {
-          output += '⚠️ No heartbeat memory found. Substrate health is unknown. ' +
-                    'Either the cron has not run yet or the heartbeat memory was deleted.\n\n';
-        }
-
-        output += `── PACKET GENERATED AT ${new Date().toISOString()} ──`;
-
-        // Surface partial failures at the bottom so they don't get missed
-        const errors = [];
-        if (recentSubstrateResult.status === 'rejected') errors.push('recent_substrate query failed: ' + recentSubstrateResult.reason.message);
-        if (recentRawResult.status === 'rejected') errors.push('recent_raw query failed: ' + recentRawResult.reason.message);
-        if (deferredAsksResult.status === 'rejected') errors.push('deferred_asks query failed: ' + deferredAsksResult.reason.message);
-        if (healthResult.status === 'rejected') errors.push('health query failed: ' + healthResult.reason.message);
-        if (upcomingResult.status === 'rejected') errors.push('upcoming query failed: ' + upcomingResult.reason.message);
-        if (namingDayResult.status === 'rejected') errors.push('naming-day query failed: ' + namingDayResult.reason.message);
-        if (principlesResult.status === 'rejected') errors.push('principles query failed: ' + principlesResult.reason.message);
-        if (selfNotesResult.status === 'rejected') errors.push('self-notes query failed: ' + selfNotesResult.reason.message);
-        if (architectResponsesResult.status === 'rejected') errors.push('architect-responses query failed: ' + architectResponsesResult.reason.message);
-        if (errors.length > 0) {
-          output += '\n\n⚠️ PARTIAL FAILURES (some packet sections may be incomplete):\n' +
-                    errors.map(e => '  - ' + e).join('\n');
-        }
-
-        resultText = output;
-        triggerAutoStore(apiKey, name, `organism_wake_up days=${days}`, resultText);
         break;
       }
 
@@ -1262,7 +635,6 @@ async function handleTool(apiKey, name, args) {
         if (anchor && domain) confirmation += ' ⚓ (dormant, surfaces in ' + domain + ' context)';
         else if (relevantDate) confirmation += ' (relevant: ' + relevantDate + ')';
 
-        triggerAutoStore(apiKey, name, key, value);
         resultText = confirmation;
         break;
       }
@@ -1297,7 +669,6 @@ async function handleTool(apiKey, name, args) {
           if (project.basePath) output += 'Path: ' + project.basePath + '\n';
           resultText = output;
         }
-        triggerAutoStore(apiKey, name, args.name, resultText);
         break;
       }
 
@@ -1423,7 +794,7 @@ app.get('/health', (req, res) => {
     status: apiHealthy ? 'ok' : 'degraded',
     version: VERSION,
     tools: TOOLS.length,
-    brain: 'ORGANISM WAKE-UP PACKET',
+    brain: 'one door in, one door out',
     now: now.short,
     timezone: now.timezone,
     apiHealthy,
@@ -1486,6 +857,6 @@ app.post('/sse', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — ORGANISM WAKE-UP PACKET — on port ' + PORT));
+app.listen(PORT, () => console.log('STCKY MCP SSE v' + VERSION + ' — one door in, one door out — on port ' + PORT));
 
 export default app;
