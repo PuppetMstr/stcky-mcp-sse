@@ -1,5 +1,28 @@
 /**
- * STCKY MCP SSE Server v4.22.0 — TWO DOORS, ONE SEARCH
+ * STCKY MCP SSE Server v4.23.0 — ONE DOOR IN, ONE DOOR OUT (NAMED)
+ *
+ * CHANGELOG v4.23.0:
+ * - RENAMED: associative_recall → search. The OUT door now matches the
+ *   name Chaos's federation Action uses. One protocol, both surfaces.
+ *   Per May 8 canon: "ideally there'll only be one thing you need to be
+ *   able to do." That door is search.
+ * - DEFAULT BEHAVIOR CHANGED: search with no query → NOW-anchored corpus
+ *   read. Fans out to /api/memory/recent + /api/objects/recent in parallel,
+ *   merges time-descending. No semantic ranker. The "look closest to NOW"
+ *   move is the default; ranker is opt-in.
+ * - QUERY NOW OPTIONAL: with query, search calls /api/associative as
+ *   before (semantic + temporal scoring). Without query, structural
+ *   recent-corpus pull. Same tool, two modes.
+ * - RATIONALE: associative_recall's semantic-first default kept biasing
+ *   reads toward what's similar-to-keywords over what's closest-to-NOW.
+ *   The trip kept happening. Renaming is half the fix; redefaulting is
+ *   the other half. Both ship together so the new name forces the new
+ *   habit instead of muscle-memory carrying old behavior.
+ * - PARAMETERS: query (optional), hours (default 24), limit (default 30),
+ *   include ('both' | 'curated' | 'raw', default 'both').
+ * - PRESERVED: get_now description still mentions associative_recall as
+ *   well — kept for one cycle in case any external client still calls
+ *   the old name. Will deprecate next version.
  *
  * CHANGELOG v4.22.0:
  * - REMOVED: organism_wake_up tool case (~180 lines of slice-machinery
@@ -64,7 +87,7 @@
  *
  * CORE TOOLS (9):
  * 1. get_now — DEPRECATED; time now in every response
- * 2. associative_recall — semantic + temporal retrieval (the read door)
+ * 2. search — NOW-anchored corpus by default; semantic mode with query (the read door)
  * 3. upcoming — date-shaped forward sweep
  * 4. memory_store — save curated memories
  * 5. memory_delete — remove memories by category + key
@@ -87,7 +110,7 @@ const app = express();
 app.use(express.json());
 
 const API_URL = process.env.STCKY_API_URL || 'https://api.stcky.ai';
-const VERSION = '4.22.0';
+const VERSION = '4.23.0';
 const DEFAULT_TIMEZONE = 'UTC';
 
 // Cache user timezones per API key (session-level)
@@ -264,7 +287,7 @@ function fireAutoCaptureEvent(apiKey, evt) {
   const READ_ONLY_TOOLS = new Set([
     'ingest',              // recursion guard
     'get_now',             // deprecated, pure read
-    'associative_recall',  // primary read path - ephemeral
+    'search',              // primary read path - ephemeral
     'upcoming',            // forward sweep read - ephemeral
     'enrich',              // entity extraction read - ephemeral
     'project_get',         // project lookup read - ephemeral
@@ -307,7 +330,7 @@ function fireAutoCaptureEvent(apiKey, evt) {
 
 function degradedResponse(toolName, error) {
   const messages = {
-    associative_recall: '⚠️ Memory service temporarily unavailable. Error: ' + error,
+    search: '⚠️ Memory service temporarily unavailable. Error: ' + error,
     upcoming: '⚠️ Upcoming-items lookup unavailable. Error: ' + error,
     memory_store: '⚠️ Unable to save to memory. Error: ' + error,
     memory_delete: '⚠️ Unable to delete memory. Error: ' + error,
@@ -370,19 +393,21 @@ async function checkApiHealth(apiKey) {
 const TOOLS = [
   {
     name: 'get_now',
-    description: 'DEPRECATED as of v4.11.0 — every tool response now carries NOW time automatically. Kept for backward compatibility. Prefer calling associative_recall or any other tool instead; time comes free with every response.',
+    description: 'DEPRECATED as of v4.11.0 — every tool response now carries NOW time automatically. Kept for backward compatibility. Prefer calling search or any other tool instead; time comes free with every response.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   {
-    name: 'associative_recall',
-    description: 'PRIMARY RECALL MECHANISM. Semantic search with temporal NOW scoring — vector similarity + recency + urgency combined. Returns both curated memories and raw ingested objects (conversation turns, documents, tool events). Response includes current time at the top.',
+    name: 'search',
+    description: 'PRIMARY READ DOOR. Two modes, one tool. WITHOUT query: NOW-anchored corpus read — fans out to /api/memory/recent (curated) and /api/objects/recent (raw conversation turns + tool events) in parallel, merges time-descending. This is the default and the one to reach for first when you want to see what is closest to NOW. WITH query: semantic + temporal scoring (vector similarity + recency + urgency) via /api/associative — opt in only when you need targeted by-name lookup. Returns memories and raw objects together, time-descending in corpus mode, ranked in semantic mode. Response includes current time at the top.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Natural language query' },
-        limit: { type: 'number', description: 'Max results' }
+        query: { type: 'string', description: 'Optional natural language query. Omit for NOW-anchored corpus read; include only for targeted semantic lookup.' },
+        hours: { type: 'number', description: 'Corpus mode only: window backward from NOW in hours (default 24)' },
+        limit: { type: 'number', description: 'Max results total (default 30 in corpus mode, 10 in semantic mode)' },
+        include: { type: 'string', description: "Corpus mode only: 'both' (default), 'curated', or 'raw'" }
       },
-      required: ['query']
+      required: []
     }
   },
   {
@@ -545,44 +570,136 @@ async function handleTool(apiKey, name, args) {
         break;
       }
 
-      case 'associative_recall': {
-        const query = args.query;
-        const limit = args.limit || 10;
+      case 'search': {
+        const query = (args && typeof args.query === 'string' && args.query.trim()) ? args.query.trim() : null;
 
-        result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
+        // ────────────────────────────────────────────────────────────────
+        // SEMANTIC MODE — query present. Existing /api/associative path.
+        // ────────────────────────────────────────────────────────────────
+        if (query) {
+          const limit = args.limit || 10;
+          result = await apiCall(apiKey, 'POST', '/api/associative', { query, limit });
 
-        let output = '';
+          let output = '';
+          const hasMemories = result.memories && result.memories.length > 0;
+          const hasObjects  = result.objects  && result.objects.length  > 0;
 
-        const hasMemories = result.memories && result.memories.length > 0;
-        const hasObjects  = result.objects  && result.objects.length  > 0;
+          if (!hasMemories && !hasObjects) {
+            resultText = 'No related memories or objects found.';
+          } else {
+            if (hasMemories) {
+              output += result.memories.length + ' related memories:\n\n';
+              result.memories.forEach((m, i) => {
+                const ts = formatTimestamp(m.updatedAt || m.createdAt);
+                const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
+                const anchor = m.anchor ? ' ⚓' : '';
+                const domain = m.domain ? ' [' + m.domain + ']' : '';
+                output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
+                output += '   ' + m.value + '\n\n';
+              });
+            }
 
-        if (!hasMemories && !hasObjects) {
-          resultText = 'No related memories or objects found.';
+            if (hasObjects) {
+              if (hasMemories) output += '\n';
+              output += result.objects.length + ' related objects (raw ingested content):\n\n';
+              result.objects.forEach((o, i) => {
+                const ts = formatTimestamp(o.timestamp || o.ingested_at);
+                const src = o.source ? ' [' + o.source + ']' : '';
+                const spk = o.speaker ? ' (' + o.speaker + ')' : '';
+                const turn = (o.turn_index !== null && o.turn_index !== undefined) ? ' turn ' + o.turn_index : '';
+                output += (i + 1) + '. ' + (o.source_type || 'object') + src + spk + turn + (ts ? ' (' + ts + ')' : '') + '\n';
+                const snippet = (o.content || '').slice(0, 500);
+                output += '   ' + snippet + (o.content && o.content.length > 500 ? '...' : '') + '\n\n';
+              });
+            }
+
+            resultText = output;
+          }
+          break;
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // CORPUS MODE — no query. NOW-anchored, time-descending, structural.
+        // Fans out to /api/memory/recent + /api/objects/recent in parallel.
+        // ────────────────────────────────────────────────────────────────
+        const hours = (args && typeof args.hours === 'number' && args.hours > 0) ? args.hours : 24;
+        const totalLimit = (args && typeof args.limit === 'number' && args.limit > 0) ? args.limit : 30;
+        const include = (args && typeof args.include === 'string') ? args.include : 'both';
+        const wantCurated = (include === 'both' || include === 'curated');
+        const wantRaw     = (include === 'both' || include === 'raw');
+
+        // Per-side fetch caps — overshoot a bit, then trim by total limit after merge.
+        const perSideLimit = Math.min(totalLimit + 10, 100);
+
+        const memoryEndpoint  = '/api/memory/recent?hours='   + encodeURIComponent(hours) + '&limit=' + encodeURIComponent(perSideLimit);
+        const objectsEndpoint = '/api/objects/recent?windowHours=' + encodeURIComponent(hours) + '&limit=' + encodeURIComponent(perSideLimit);
+
+        const [memResult, objResult] = await Promise.allSettled([
+          wantCurated ? apiCall(apiKey, 'GET', memoryEndpoint)  : Promise.resolve({ memories: [] }),
+          wantRaw     ? apiCall(apiKey, 'GET', objectsEndpoint) : Promise.resolve({ objects:  [] }),
+        ]);
+
+        const memErr = (memResult.status === 'rejected') ? String(memResult.reason && memResult.reason.message || memResult.reason) : null;
+        const objErr = (objResult.status === 'rejected') ? String(objResult.reason && objResult.reason.message || objResult.reason) : null;
+        const memories = (memResult.status === 'fulfilled' && memResult.value && Array.isArray(memResult.value.memories)) ? memResult.value.memories : [];
+        const objects  = (objResult.status === 'fulfilled' && objResult.value && Array.isArray(objResult.value.objects )) ? objResult.value.objects  : [];
+
+        // Merge into a unified time-descending list. Each item carries its own layer tag.
+        const items = [];
+        memories.forEach(m => {
+          const t = m.updatedAt || m.createdAt;
+          items.push({ layer: 'curated', ts: t, sortKey: new Date(t || 0).getTime(), data: m });
+        });
+        objects.forEach(o => {
+          const t = o.ingested_at || o.timestamp;
+          items.push({ layer: 'raw', ts: t, sortKey: new Date(t || 0).getTime(), data: o });
+        });
+        items.sort((a, b) => b.sortKey - a.sortKey);
+        const trimmed = items.slice(0, totalLimit);
+
+        if (trimmed.length === 0) {
+          let msg = 'No substrate activity in the last ' + hours + 'h';
+          if (memErr || objErr) {
+            msg += ' (note: ';
+            if (memErr) msg += 'curated fetch failed: ' + memErr + (objErr ? '; ' : '');
+            if (objErr) msg += 'raw fetch failed: ' + objErr;
+            msg += ')';
+          }
+          msg += '.';
+          resultText = msg;
         } else {
-          if (hasMemories) {
-            output += result.memories.length + ' related memories:\n\n';
-            result.memories.forEach((m, i) => {
-              const ts = formatTimestamp(m.updatedAt || m.createdAt);
+          let output = 'RECENT SUBSTRATE — last ' + hours + 'h, ' + trimmed.length + ' item' + (trimmed.length === 1 ? '' : 's') + ', time-descending';
+          if (include !== 'both') output += ' (' + include + ' only)';
+          output += ':\n\n';
+
+          trimmed.forEach((it, i) => {
+            const ts = formatTimestamp(it.ts);
+            if (it.layer === 'curated') {
+              const m = it.data;
               const rd = m.relevantDate ? ' [due: ' + new Date(m.relevantDate).toLocaleDateString() + ']' : '';
               const anchor = m.anchor ? ' ⚓' : '';
               const domain = m.domain ? ' [' + m.domain + ']' : '';
-              output += (i + 1) + '. [' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
-              output += '   ' + m.value + '\n\n';
-            });
-          }
-
-          if (hasObjects) {
-            if (hasMemories) output += '\n';
-            output += result.objects.length + ' related objects (raw ingested content):\n\n';
-            result.objects.forEach((o, i) => {
-              const ts = formatTimestamp(o.timestamp || o.ingested_at);
+              output += (i + 1) + '. [curated:' + m.category + '] ' + m.key + (ts ? ' (' + ts + ')' : '') + rd + domain + anchor + '\n';
+              const snippet = (m.value || '').slice(0, 500);
+              output += '   ' + snippet + (m.value && m.value.length > 500 ? '...' : '') + '\n\n';
+            } else {
+              const o = it.data;
               const src = o.source ? ' [' + o.source + ']' : '';
               const spk = o.speaker ? ' (' + o.speaker + ')' : '';
               const turn = (o.turn_index !== null && o.turn_index !== undefined) ? ' turn ' + o.turn_index : '';
-              output += (i + 1) + '. ' + (o.source_type || 'object') + src + spk + turn + (ts ? ' (' + ts + ')' : '') + '\n';
-              const snippet = (o.content || '').slice(0, 500);
-              output += '   ' + snippet + (o.content && o.content.length > 500 ? '...' : '') + '\n\n';
-            });
+              output += (i + 1) + '. [raw:' + (o.source_type || 'object') + ']' + src + spk + turn + (ts ? ' (' + ts + ')' : '') + '\n';
+              const content = o.content || o.content_snippet || '';
+              const snippet = content.slice(0, 500);
+              output += '   ' + snippet + (content.length > 500 ? '...' : '') + '\n\n';
+            }
+          });
+
+          if (memErr || objErr) {
+            output += '⚠️ Partial result — ';
+            if (memErr) output += 'curated fetch failed: ' + memErr;
+            if (memErr && objErr) output += '; ';
+            if (objErr) output += 'raw fetch failed: ' + objErr;
+            output += '\n';
           }
 
           resultText = output;
